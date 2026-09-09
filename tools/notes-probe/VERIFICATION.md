@@ -1037,6 +1037,131 @@ schema, dependency, or version change is needed for this governance closure.
 
 Phase 13 A2.1 is ready for a separate version/tag/release preparation pass.
 
+## Phase 15 A1 — runtime performance profiling
+
+`APPLE_NOTES_TUI_PERF=1` enables an opt-in, append-only trace at
+`/private/tmp/apple-notes-tui-perf.log`; normal operation remains silent. Each
+line contains only monotonic elapsed time, thread, operation, an optional
+opaque stable target, duration, and result. It never records note/folder names,
+note bodies, attachment names, AppleScript payloads, or user paths.
+
+The trace covers cache bootstrap/full-note/snapshot operations, UI startup and
+slow key handlers, live-refresh mutex acquisition and traversal, ordinary
+folder/preview loaders, and every production `osascript` bridge operation.
+Read-only launches against the normal user state measured cache bootstrap and
+first-frame readiness at 1–3 ms, while the synchronous initial live traversal
+was 4,540 ms cold-ish and 3,584 ms warm. The first run spent 682 ms in
+`accounts`, 1,882 ms in `folders`, and 1,975 ms in `notes`; the warm run spent
+402 ms, 1,979 ms, and 1,201 ms respectively. SQLite snapshot reads/writes were
+below the trace's 1 ms resolution and backend mutex wait was 0 ms.
+
+Code inspection and existing focused tests establish the key call graph:
+startup performs cache bootstrap, enters the terminal, then synchronously calls
+`App::refresh`/`read_live_state` (`accounts`, `folders`, `notes`, optional
+selected `get_note`) before the event loop. Ordinary folder activation calls
+`load_notes_for_selection_with_cache`, which synchronously invokes `notes` and
+then `load_selected_note_with_cache`; ordinary live j/k/Home/End selection calls
+that same selected-note loader and synchronously invokes `get_note` for every
+highlighted row. Cached-mode previews consult `CacheStore::load_note` first,
+but live mode does not. The shared backend mutex is held for the complete
+`read_live_state` traversal, serializing its account/folder/list/preview calls.
+
+Root-cause ranking: P0 is synchronous initial live refresh before the first
+draw and synchronous live `notes` plus `get_note` calls during browsing; P1 is
+multiple serial `osascript` processes for every live traversal and the mutex
+scope that covers the complete traversal; P2 is cache presentation (cached data
+is loaded before the terminal, but startup still waits for `App::refresh` before
+the first draw); P3 is SQLite/session work, which was sub-millisecond in the
+captured trace. The terminal harness could safely capture startup but could not
+reliably send controlled navigation keys, so folder/ten-row distributions are
+instrumentation-ready rather than fabricated.
+
+Phase 15 A2 should first move initial live reconciliation behind the first
+cached frame, then make ordinary folder and preview selection cache-first with
+generation/latest-selection suppression for obsolete live reads. That sequence
+targets the measured AppleScript calls without changing Notes.app authority,
+the disposable-cache contract, or mutation behavior. No Notes mutation,
+NoteStore access, cache-schema change, dependency change, or version bump was
+performed in this profiling pass.
+
+## Phase 15 A2.1 — non-blocking cache-first startup
+
+Startup restores the derived cache and renders the first frame before
+scheduling exactly one live `accounts` -> `folders` -> `notes` reconciliation
+worker. The existing read worker and result channel are reused; the worker does
+not mutate `App` or SQLite. The UI thread polls and applies the authoritative
+result through stable-ID reconciliation and the existing cache persistence path.
+
+The deterministic regression `startup_live_refresh_does_not_block_cached_ui`
+holds the first backend read behind a channel, proves cached notes and a local
+help action remain available before release, then releases the worker and
+verifies the result returns to `Live`. No correctness sleep or real Notes.app
+mutation is used. Startup failures retain valid cached runtime state and use
+the existing backend-unavailable semantics; the periodic timer cannot launch a
+second traversal while startup is in flight. A no-cache startup still creates
+the normal empty/loading UI and remains event-loop driven rather than blocking
+on the backend.
+
+## Phase 15 A2.2 — cache-first folder and note navigation
+
+Live-mode preview now consults the derived full-note cache before starting a
+backend read. A cached preview remains visible while the authoritative
+`get_note` worker runs; the UI thread applies the result only when its stable
+NoteId and navigation generation still match. Preview requests made while one
+read is in flight are coalesced to the latest selected NoteId, so obsolete
+intermediate selections do not create a serialized backend chain.
+
+Folder activation similarly uses cached snapshot rows for the target stable
+FolderId when available, then schedules the authoritative `notes` read. A
+folder result is applied only when its stable context and generation still
+match the current navigation context. Cache misses show the existing loading /
+empty state and remain responsive. No cache schema, backend API, NoteStore
+access, or mutation path changed; cache writes remain UI-thread-only and
+authoritative live results still win.
+
+## Phase 15 A2.3 — real-user runtime validation
+
+Validation used the current optimized worktree binary
+`tools/notes-probe/target/release/apple-notes-tui`, not the Homebrew artifact.
+The binary reports `apple-notes-tui 0.1.0` because the project version remains
+unchanged. No Notes mutation probe, NoteStore access, cache clear, or ignored
+destructive test was performed.
+
+The read-only launch with `APPLE_NOTES_TUI_PERF=1` produced a first cached frame
+in about 7 ms and scheduled live reconciliation in the background. While the
+backend read was active and subsequently failed due to unavailable Automation,
+the TUI accepted `?` immediately and rendered the help popup; the process did
+not exhibit a multi-second input freeze. The trace showed one startup
+`accounts` read attempt, followed by the existing cached-backend-unavailable
+state. Interactive rapid folder/note navigation against live Notes.app could
+not be characterized because the environment did not grant a usable Notes.app
+Automation backend; no latency or call-count values were fabricated.
+
+Phase 15 A2.2c deterministic coverage adds:
+
+- `live_mode_preview_cache_miss_is_async`
+- `live_mode_folder_cache_miss_is_async`
+- `rapid_note_selection_coalesces_to_latest_preview`
+- `rapid_ten_note_navigation_executes_only_inflight_and_latest_preview`
+
+These regressions prove cache misses enter the bounded navigation worker,
+pending preview selection is limited to one latest request, and ordinary
+mutation reconciliation continues to use its synchronous authoritative path.
+The release workspace build, strict clippy, and `git diff --check` also pass.
+
+## Phase 15 A2.4 — refresh de-duplication and folder retention
+
+Refresh instrumentation records `refresh.reason=startup`, `periodic`, or
+`manual`. Startup initializes the same refresh timestamp used by the periodic
+timer, so the configured interval remains the lower bound for the next
+automatic traversal. Revisited folders retain their in-memory summary rows by
+stable `FolderId`; cache-first browsing can reuse rows during the same process
+while still scheduling authoritative validation.
+
+The existing single navigation worker and bounded pending request remain in
+place. No AppleScript/process optimization, cache schema change, mutation
+behavior change, or NoteStore access was introduced.
+
 ## Phase 14 A1 — version and local release preparation
 
 The first public release remains `0.1.0`: every workspace package and the TUI
@@ -1058,3 +1183,28 @@ There is no remote publication in this preparation scope. After the committed
 tree and local tag are verified, the archive must exclude local AI instruction
 files and generated artifacts while still building offline from the embedded
 AppleScript source.
+
+## Phase 16 A1 — v0.1.1 local release preparation
+
+The release candidate is version `0.1.1` across all workspace packages. The
+offline workspace check, strict clippy, package tests, workspace tests,
+release build, and diff check pass. The optimized Apple Silicon binary reports
+`apple-notes-tui 0.1.1` and links only against macOS system libraries.
+
+Local source and aarch64 binary archives were staged outside the repository,
+with AI/local files, build output, private paths, and logs excluded. Their
+SHA-256 values are recorded in `SHA256SUMS`; the source archive also completed
+offline check, tests, and release build from a clean extraction. No commit,
+tag, push, GitHub release, or Homebrew tap change was performed.
+
+## Phase 15 A2.4c — regression closure
+
+Deterministic regressions cover startup/periodic de-duplication, interval
+measurement from the refresh request, and manual refresh before the periodic
+deadline. Folder summary rows are retained by stable `FolderId`, authoritative
+folder results replace retained rows, and mutation invalidation prevents stale
+rows from surviving create/delete/move. Generation checks discard stale folder
+and preview results. The refresh traversal remains accounts -> folders ->
+notes -> selected preview -> attachments; no cache or transport scope was
+expanded. Tests use injected clocks/state and do not sleep or perform real
+Notes.app mutations.

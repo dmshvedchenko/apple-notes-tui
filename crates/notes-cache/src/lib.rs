@@ -6,9 +6,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use notes_core::{Account, Folder, Note, NoteId, NoteSummary};
+use notes_core::{perf, Account, Folder, Note, NoteId, NoteSummary};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 use thiserror::Error;
 
 pub const SCHEMA_VERSION: i32 = 1;
@@ -244,19 +245,59 @@ impl SqliteNotesCache {
 
 impl CacheStore for SqliteNotesCache {
     fn load_bootstrap(&self) -> Result<CachedState, CacheError> {
-        SqliteNotesCache::load_bootstrap(self)
+        let started = Instant::now();
+        let result = SqliteNotesCache::load_bootstrap(self);
+        perf::event(
+            "cache.load_bootstrap",
+            None,
+            started,
+            if result.is_ok() { "ok" } else { "error" },
+        );
+        result
     }
     fn replace_snapshot(&mut self, state: &CachedState) -> Result<(), CacheError> {
-        SqliteNotesCache::replace_snapshot(self, state)
+        let started = Instant::now();
+        let result = SqliteNotesCache::replace_snapshot(self, state);
+        perf::event(
+            "cache.replace_snapshot",
+            None,
+            started,
+            if result.is_ok() { "ok" } else { "error" },
+        );
+        result
     }
     fn load_note(&self, id: &NoteId) -> Result<Option<Note>, CacheError> {
-        SqliteNotesCache::load_note(self, id)
+        let started = Instant::now();
+        let result = SqliteNotesCache::load_note(self, id);
+        perf::event(
+            "cache.load_note",
+            Some(id.as_str()),
+            started,
+            if result.is_ok() { "ok" } else { "error" },
+        );
+        result
     }
     fn upsert_note(&mut self, note: &Note) -> Result<(), CacheError> {
-        SqliteNotesCache::upsert_note(self, note)
+        let started = Instant::now();
+        let result = SqliteNotesCache::upsert_note(self, note);
+        perf::event(
+            "cache.upsert_note",
+            Some(note.summary.id.as_str()),
+            started,
+            if result.is_ok() { "ok" } else { "error" },
+        );
+        result
     }
     fn remove_note(&self, id: &NoteId) -> Result<(), CacheError> {
-        SqliteNotesCache::remove_note(self, id)
+        let started = Instant::now();
+        let result = SqliteNotesCache::remove_note(self, id);
+        perf::event(
+            "cache.remove_note",
+            Some(id.as_str()),
+            started,
+            if result.is_ok() { "ok" } else { "error" },
+        );
+        result
     }
 }
 

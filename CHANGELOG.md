@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.1 - 2026-09-09
+
+### Changed
+
+- Cached Notes data is shown immediately while live Notes.app reconciliation runs
+  in the background.
+- Folder and note navigation use cached data immediately and refresh
+  asynchronously; rapid navigation coalesces obsolete reads.
+- Previously visited folder summaries are retained during the session.
+
+### Fixed
+
+- Reduced UI stalls during long Apple Events reads and prevented stale reads
+  from overwriting newer selections.
+
+### Diagnostics
+
+- Added opt-in privacy-safe tracing with `APPLE_NOTES_TUI_PERF=1`.
+
 ## 0.1.0 - 2026-09-09
 
 ### Highlights

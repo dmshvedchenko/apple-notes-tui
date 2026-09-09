@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use notes_cache::{CacheStore, CachedState};
+use notes_core::perf;
 use notes_core::{
     classify_editability, parse_notes_html, serialize_notes_html, Account, AccountId,
     AttachmentAccessStatus, AttachmentCapabilities, AttachmentId, AttachmentMetadata,
@@ -1038,6 +1039,7 @@ enum WorkerRefreshResult {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RefreshOrigin {
+    Startup,
     Automatic,
     Manual,
 }
@@ -1051,6 +1053,24 @@ enum PeriodicRefreshState {
         cancellation: Arc<AtomicBool>,
         cancel_requested: bool,
     },
+}
+
+enum NavigationWorkerResult {
+    Preview {
+        id: NoteId,
+        generation: u64,
+        result: Result<Note, NotesError>,
+    },
+    Folder {
+        context: RefreshContext,
+        generation: u64,
+        result: Result<NotesPage, NotesError>,
+    },
+}
+
+enum NavigationRequest {
+    Preview(NoteId),
+    Folder(RefreshContext),
 }
 
 enum UpdateWorkerResult {
@@ -1388,6 +1408,7 @@ pub struct App {
     pub accounts: Vec<Account>,
     pub folders: Vec<Folder>,
     pub notes: Vec<NoteSummary>,
+    folder_notes_cache: HashMap<FolderId, Vec<NoteSummary>>,
     pub selected_note: Option<Note>,
     cached_preview_state: Option<CachedPreviewState>,
     navigation: Vec<NavigationItem>,
@@ -1428,6 +1449,9 @@ pub struct App {
     periodic_refresh: PeriodicRefreshState,
     update_worker: Option<mpsc::Receiver<UpdateWorkerResult>>,
     pending_foreground_intent: Option<PendingForegroundIntent>,
+    navigation_worker: Option<mpsc::Receiver<NavigationWorkerResult>>,
+    navigation_generation: u64,
+    pending_navigation: Option<NavigationRequest>,
 }
 
 impl App {
@@ -1441,6 +1465,7 @@ impl App {
             accounts: Vec::new(),
             folders: Vec::new(),
             notes: Vec::new(),
+            folder_notes_cache: HashMap::new(),
             selected_note: None,
             cached_preview_state: None,
             navigation: Vec::new(),
@@ -1481,6 +1506,9 @@ impl App {
             periodic_refresh: PeriodicRefreshState::Idle,
             update_worker: None,
             pending_foreground_intent: None,
+            navigation_worker: None,
+            navigation_generation: 0,
+            pending_navigation: None,
         }
     }
 
@@ -1716,6 +1744,7 @@ impl App {
     }
 
     pub fn bootstrap_cache(&mut self) {
+        let started = Instant::now();
         let result = self.cache.as_ref().map(|cache| cache.load_bootstrap());
         match result {
             Some(Ok(state))
@@ -1733,6 +1762,7 @@ impl App {
             }
             _ => {}
         }
+        perf::event("tui.bootstrap_cache", None, started, "complete");
     }
 
     pub fn demo() -> Self {
@@ -1746,6 +1776,13 @@ impl App {
         self.navigation = build_navigation(&self.accounts, &self.folders);
         self.selected_navigation = self.default_navigation_index();
         self.restore_pending_session_context();
+        self.folder_notes_cache.clear();
+        for note in &state.notes {
+            self.folder_notes_cache
+                .entry(note.folder_id.clone())
+                .or_default()
+                .push(note.clone());
+        }
         self.notes = state.notes;
         self.restore_pending_session_search();
         self.restore_visible_selection(self.session_note_for_current_context());
@@ -1774,6 +1811,22 @@ impl App {
 
     pub fn refresh(&mut self) {
         self.refresh_at(Instant::now());
+    }
+
+    /// Starts initial live reconciliation off the UI thread while preserving
+    /// the cache-backed state for immediate presentation.
+    pub fn start_initial_refresh(&mut self) {
+        if matches!(self.periodic_refresh, PeriodicRefreshState::Idle)
+            && self.update_worker.is_none()
+        {
+            perf::event(
+                "startup.live_refresh_scheduled",
+                None,
+                Instant::now(),
+                "background=true",
+            );
+            self.start_refresh_worker(Instant::now(), RefreshOrigin::Startup);
+        }
     }
 
     fn refresh_at(&mut self, now: Instant) {
@@ -1824,6 +1877,10 @@ impl App {
             .map(|note| note.summary.id.clone())
             .or_else(|| self.selected_note_id());
         self.notes = read.notes;
+        if let RefreshContext::Folder(folder_id) = &read.context {
+            self.folder_notes_cache
+                .insert(folder_id.clone(), self.notes.clone());
+        }
         self.restore_session_search(session.as_ref());
         self.preview_scroll = 0;
         self.status = StatusMessage {
@@ -1866,6 +1923,7 @@ impl App {
     }
 
     pub fn poll_periodic_refresh(&mut self) {
+        self.poll_navigation_worker();
         self.poll_update_worker();
         let result = match &self.periodic_refresh {
             PeriodicRefreshState::Idle => return,
@@ -1887,7 +1945,10 @@ impl App {
                 if generation == self.refresh_generation =>
             {
                 match *result {
-                    Ok(read) => self.apply_live_refresh_read(read),
+                    Ok(read) => {
+                        self.apply_live_refresh_read(read);
+                        perf::event("startup.live_reconciled", None, Instant::now(), "complete");
+                    }
                     Err(NotesError::Cancelled) => {}
                     Err(error) => self.set_error(error),
                 }
@@ -1911,6 +1972,150 @@ impl App {
             _ => {}
         }
         self.run_pending_foreground_intent();
+    }
+
+    fn poll_navigation_worker(&mut self) {
+        let Some(receiver) = &self.navigation_worker else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.navigation_worker = None;
+                self.start_pending_navigation();
+                return;
+            }
+        };
+        self.navigation_worker = None;
+        match result {
+            NavigationWorkerResult::Preview {
+                id,
+                generation,
+                result,
+            } if generation == self.navigation_generation
+                && self.selected_note_id().as_ref() == Some(&id) =>
+            {
+                match result {
+                    Ok(note) => {
+                        self.selected_note = Some(note.clone());
+                        if let Some(cache) = &mut self.cache {
+                            if let Err(error) = cache.upsert_note(&note) {
+                                self.status = StatusMessage {
+                                    text: format!("Live · cache warning: {error}"),
+                                    is_error: false,
+                                };
+                            }
+                        }
+                        perf::event(
+                            "navigation.preview.live_applied",
+                            Some(id.as_str()),
+                            Instant::now(),
+                            "complete",
+                        );
+                    }
+                    Err(error) => self.set_error(error),
+                }
+            }
+            NavigationWorkerResult::Folder {
+                context,
+                generation,
+                result,
+            } if generation == self.navigation_generation
+                && self.refresh_context().as_ref() == Some(&context) =>
+            {
+                match result {
+                    Ok(NotesPage { items, total, .. }) => {
+                        let preferred = self.selected_note_id();
+                        self.notes = items;
+                        self.status = StatusMessage {
+                            text: format!("{total} notes"),
+                            is_error: false,
+                        };
+                        self.recompute_search();
+                        self.restore_visible_selection(preferred);
+                        self.load_selected_note_with_cache(true);
+                    }
+                    Err(error) => self.set_error(error),
+                }
+            }
+            _ => {}
+        }
+        self.start_pending_navigation();
+    }
+
+    fn start_pending_navigation(&mut self) {
+        if self.navigation_worker.is_some() {
+            return;
+        }
+        let Some(request) = self.pending_navigation.take() else {
+            return;
+        };
+        match request {
+            NavigationRequest::Preview(id) => self.start_preview_worker(id),
+            NavigationRequest::Folder(context) => self.start_folder_worker(context),
+        }
+    }
+
+    fn queue_navigation_request(&mut self, request: NavigationRequest) {
+        // A context change supersedes any preview from the previous folder;
+        // within one kind, the latest request wins.
+        self.pending_navigation = Some(request);
+    }
+
+    fn start_preview_worker(&mut self, id: NoteId) {
+        self.navigation_generation = self.navigation_generation.wrapping_add(1);
+        let generation = self.navigation_generation;
+        let backend = Arc::clone(&self.backend);
+        let (sender, receiver) = mpsc::channel();
+        let worker_id = id.clone();
+        thread::spawn(move || {
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                backend.lock().unwrap().get_note(&worker_id)
+            }));
+            let result = match result {
+                Ok(result) => result,
+                Err(_) => Err(NotesError::Backend(
+                    "preview worker ended unexpectedly".into(),
+                )),
+            };
+            let _ = sender.send(NavigationWorkerResult::Preview {
+                id: worker_id,
+                generation,
+                result,
+            });
+        });
+        self.navigation_worker = Some(receiver);
+        perf::event(
+            "navigation.preview.live_scheduled",
+            Some(id.as_str()),
+            Instant::now(),
+            "background=true",
+        );
+    }
+
+    fn start_folder_worker(&mut self, context: RefreshContext) {
+        self.navigation_generation = self.navigation_generation.wrapping_add(1);
+        let generation = self.navigation_generation;
+        let query = context.query();
+        let backend = Arc::clone(&self.backend);
+        let (sender, receiver) = mpsc::channel();
+        let worker_context = context.clone();
+        thread::spawn(move || {
+            let result = catch_unwind(AssertUnwindSafe(|| backend.lock().unwrap().notes(&query)));
+            let result = match result {
+                Ok(result) => result,
+                Err(_) => Err(NotesError::Backend(
+                    "folder worker ended unexpectedly".into(),
+                )),
+            };
+            let _ = sender.send(NavigationWorkerResult::Folder {
+                context: worker_context,
+                generation,
+                result,
+            });
+        });
+        self.navigation_worker = Some(receiver);
     }
 
     fn poll_update_worker(&mut self) {
@@ -2035,6 +2240,11 @@ impl App {
     }
 
     fn finish_moved(&mut self, moved: Note, destination_name: &str) {
+        let source_folder = self.selected_folder_id().cloned();
+        if let Some(folder_id) = source_folder {
+            self.folder_notes_cache.remove(&folder_id);
+        }
+        self.folder_notes_cache.remove(&moved.summary.folder_id);
         self.load_notes_for_selection_without_cache();
         let cache_warning = self.persist_full_note(&moved);
         self.persist_cache_snapshot();
@@ -2053,6 +2263,9 @@ impl App {
     }
 
     fn finish_deleted(&mut self, deleted_id: NoteId, previous_index: usize) {
+        if let Some(folder_id) = self.selected_folder_id().cloned() {
+            self.folder_notes_cache.remove(&folder_id);
+        }
         self.load_notes_for_selection_without_cache();
         self.selected_note_index = previous_index.min(self.visible_note_count().saturating_sub(1));
         self.load_selected_note_with_cache(false);
@@ -2094,6 +2307,7 @@ impl App {
         let worker_cancellation = Arc::clone(&cancellation);
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
+            let started = Instant::now();
             let result = catch_unwind(AssertUnwindSafe(|| {
                 read_live_state(
                     &backend,
@@ -2111,6 +2325,16 @@ impl App {
                 },
                 Err(_) => WorkerRefreshResult::Panicked { generation },
             };
+            perf::event(
+                "startup.live_refresh_completed",
+                None,
+                started,
+                match &message {
+                    WorkerRefreshResult::Finished { .. } => "finished",
+                    WorkerRefreshResult::Cancelled { .. } => "cancelled",
+                    WorkerRefreshResult::Panicked { .. } => "panicked",
+                },
+            );
             let _ = sender.send(message);
         });
         self.periodic_refresh = PeriodicRefreshState::InFlight {
@@ -2124,6 +2348,12 @@ impl App {
             text: "Refreshing…".into(),
             is_error: false,
         };
+        let reason = match origin {
+            RefreshOrigin::Startup => "refresh.reason=startup",
+            RefreshOrigin::Automatic => "refresh.reason=periodic",
+            RefreshOrigin::Manual => "refresh.reason=manual",
+        };
+        perf::event("tui.refresh_started", None, Instant::now(), reason);
     }
 
     fn is_safe_for_periodic_refresh(&self) -> bool {
@@ -2914,6 +3144,7 @@ impl App {
     }
 
     fn finish_folder_created(&mut self, folder: Folder) {
+        self.folder_notes_cache.remove(&folder.id);
         let account_id = folder.account_id.clone();
         let folders_result = self.backend().folders(Some(&account_id));
         match folders_result {
@@ -3452,6 +3683,7 @@ impl App {
     }
 
     fn finish_folder_deleted(&mut self, deleted: DeletedFolder) {
+        self.folder_notes_cache.remove(&deleted.folder_id);
         let old_index = self.selected_navigation;
         let selected_account_id = self.selected_account_id();
         self.folders.retain(|folder| {
@@ -4252,6 +4484,7 @@ impl App {
         true
     }
     fn finish_saved(&mut self, note: Note, message: &str) {
+        self.folder_notes_cache.remove(&note.summary.folder_id);
         let id = note.summary.id.clone();
         self.edit = None;
         self.mode = AppMode::Normal;
@@ -5032,7 +5265,7 @@ impl App {
 
     fn activate_selection(&mut self) {
         match self.focus {
-            Focus::Navigation => self.load_notes_for_selection(),
+            Focus::Navigation => self.load_notes_for_browsing(),
             Focus::Notes => self.load_selected_note(),
             Focus::Preview => {}
         }
@@ -5047,7 +5280,7 @@ impl App {
                 if self.periodic_refresh_in_flight() {
                     self.invalidate_periodic_refresh_result();
                 } else {
-                    self.load_notes_for_selection();
+                    self.load_notes_for_browsing();
                 }
             }
             Focus::Notes => {
@@ -5072,7 +5305,7 @@ impl App {
                 if self.periodic_refresh_in_flight() {
                     self.invalidate_periodic_refresh_result();
                 } else {
-                    self.load_notes_for_selection();
+                    self.load_notes_for_browsing();
                 }
             }
             Focus::Notes => {
@@ -5092,11 +5325,24 @@ impl App {
         self.load_notes_for_selection_with_cache(true);
     }
 
+    fn load_notes_for_browsing(&mut self) {
+        self.load_notes_for_selection_with_cache_mode(true, true);
+    }
+
     fn load_notes_for_selection_without_cache(&mut self) {
         self.load_notes_for_selection_with_cache(false);
     }
 
     fn load_notes_for_selection_with_cache(&mut self, persist_full_note: bool) {
+        self.load_notes_for_selection_with_cache_mode(persist_full_note, false);
+    }
+
+    fn load_notes_for_selection_with_cache_mode(
+        &mut self,
+        persist_full_note: bool,
+        allow_async_navigation: bool,
+    ) {
+        let started = Instant::now();
         let query = match self.navigation.get(self.selected_navigation) {
             Some(NavigationItem::Account { id, .. }) => NotesQuery {
                 account_id: Some(id.clone()),
@@ -5117,6 +5363,64 @@ impl App {
                 return;
             }
         };
+        let target = query
+            .folder_id
+            .as_ref()
+            .map(|id| id.as_str())
+            .or_else(|| query.account_id.as_ref().map(|id| id.as_str()));
+        if allow_async_navigation
+            && persist_full_note
+            && matches!(self.data_source, DataSourceState::Live)
+        {
+            if let Some(cache) = &self.cache {
+                if let Some(folder_id) = query.folder_id.as_ref() {
+                    if let Some(cached_items) = self.folder_notes_cache.get(folder_id).cloned() {
+                        let preferred = self.selected_note_id();
+                        self.notes = cached_items;
+                        self.recompute_search();
+                        self.restore_visible_selection(preferred);
+                        self.load_selected_note_with_cache(persist_full_note);
+                        self.queue_navigation_request(NavigationRequest::Folder(
+                            self.refresh_context().expect("selected navigation context"),
+                        ));
+                        self.start_pending_navigation();
+                        perf::event("navigation.folder.cache_hit", target, started, "memory");
+                        return;
+                    }
+                }
+                if let Ok(state) = cache.load_bootstrap() {
+                    let cached_items: Vec<NoteSummary> = state
+                        .notes
+                        .into_iter()
+                        .filter(|note| {
+                            query
+                                .folder_id
+                                .as_ref()
+                                .is_some_and(|id| &note.folder_id == id)
+                        })
+                        .collect();
+                    if !cached_items.is_empty() {
+                        let preferred = self.selected_note_id();
+                        self.notes = cached_items;
+                        self.recompute_search();
+                        self.restore_visible_selection(preferred);
+                        self.load_selected_note_with_cache(persist_full_note);
+                        self.queue_navigation_request(NavigationRequest::Folder(
+                            self.refresh_context().expect("selected navigation context"),
+                        ));
+                        self.start_pending_navigation();
+                        perf::event("navigation.folder.cache_hit", target, started, "complete");
+                        return;
+                    }
+                }
+                perf::event("navigation.folder.cache_miss", target, started, "complete");
+                if let Some(context) = self.refresh_context() {
+                    self.queue_navigation_request(NavigationRequest::Folder(context));
+                    self.start_pending_navigation();
+                    return;
+                }
+            }
+        }
         let result = self.backend().notes(&query);
         match result {
             Ok(NotesPage { items, total, .. }) => {
@@ -5134,6 +5438,7 @@ impl App {
             }
             Err(error) => self.set_error(error),
         }
+        perf::event("tui.folder_activation", target, started, "complete");
     }
 
     fn load_selected_note(&mut self) {
@@ -5141,6 +5446,7 @@ impl App {
     }
 
     fn load_selected_note_with_cache(&mut self, persist_full_note: bool) {
+        let started = Instant::now();
         let Some(id) = self
             .visible_note(self.selected_note_index)
             .map(|summary| summary.id.clone())
@@ -5149,23 +5455,62 @@ impl App {
             self.cached_preview_state = None;
             return;
         };
-        self.selected_note = None;
+        if self
+            .selected_note
+            .as_ref()
+            .is_some_and(|note| note.summary.id != id)
+        {
+            self.selected_note = None;
+        }
         self.cached_preview_state = None;
-        if !matches!(self.data_source, DataSourceState::Live) {
-            let cached = self.cache.as_ref().map(|cache| cache.load_note(&id));
-            match cached {
-                Some(Ok(Some(note))) => {
-                    self.selected_note = Some(note);
-                    self.preview_scroll = 0;
+        if let Some(cache) = &self.cache {
+            if matches!(self.data_source, DataSourceState::Live) && !persist_full_note {
+                // Mutation reconciliation intentionally keeps its existing
+                // synchronous read-through semantics.
+            } else {
+                let cached = cache.load_note(&id);
+                let live_cache_miss =
+                    matches!(self.data_source, DataSourceState::Live) && matches!(cached, Ok(None));
+                match cached {
+                    Ok(Some(note)) => {
+                        self.selected_note = Some(note);
+                        self.preview_scroll = 0;
+                        if matches!(self.data_source, DataSourceState::Live) {
+                            self.queue_navigation_request(NavigationRequest::Preview(id.clone()));
+                            self.start_pending_navigation();
+                            perf::event(
+                                "navigation.preview.cache_hit",
+                                Some(id.as_str()),
+                                started,
+                                "complete",
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        self.cached_preview_state = Some(CachedPreviewState::MissingFullNote);
+                    }
+                    Err(error) => {
+                        self.cached_preview_state =
+                            Some(CachedPreviewState::ReadError(error.to_string()));
+                    }
                 }
-                Some(Ok(None)) | None => {
-                    self.cached_preview_state = Some(CachedPreviewState::MissingFullNote);
+                if !live_cache_miss {
+                    perf::event("tui.preview_cached", Some(id.as_str()), started, "complete");
+                    return;
                 }
-                Some(Err(error)) => {
-                    self.cached_preview_state =
-                        Some(CachedPreviewState::ReadError(error.to_string()));
-                }
+                self.queue_navigation_request(NavigationRequest::Preview(id.clone()));
+                self.start_pending_navigation();
+                perf::event(
+                    "navigation.preview.cache_miss",
+                    Some(id.as_str()),
+                    started,
+                    "complete",
+                );
+                return;
             }
+        }
+        if !matches!(self.data_source, DataSourceState::Live) {
+            self.cached_preview_state = Some(CachedPreviewState::MissingFullNote);
             return;
         }
         let result = self.backend().get_note(&id);
@@ -5186,6 +5531,7 @@ impl App {
             }
             Err(error) => self.set_error(error),
         }
+        perf::event("tui.preview_live", Some(id.as_str()), started, "complete");
     }
 
     fn scroll_preview(&mut self, delta: isize) {
@@ -5222,6 +5568,7 @@ impl App {
     }
 
     fn persist_cache_snapshot(&mut self) {
+        let started = Instant::now();
         let state = self.cached_state();
         if let Some(cache) = &mut self.cache {
             if let Err(error) = cache.replace_snapshot(&state) {
@@ -5231,6 +5578,7 @@ impl App {
                 };
             }
         }
+        perf::event("tui.persist_cache_snapshot", None, started, "complete");
     }
 
     fn require_live_backend(&mut self) -> bool {
@@ -5252,9 +5600,12 @@ fn read_live_state(
     preferred_note: Option<NoteId>,
     cancel: Option<&AtomicBool>,
 ) -> Result<LiveRefreshRead, NotesError> {
+    let started = Instant::now();
+    let mutex_started = Instant::now();
     let backend = backend
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    perf::event("tui.backend_mutex_wait", None, mutex_started, "acquired");
     let accounts = backend.accounts_with_cancel(cancel)?;
     let folders = backend.folders_with_cancel(None, cancel)?;
     let session_context = session
@@ -5291,14 +5642,16 @@ fn read_live_state(
         .as_ref()
         .map(|id| backend.get_note_with_cancel(id, cancel))
         .transpose()?;
-    Ok(LiveRefreshRead {
+    let read = LiveRefreshRead {
         accounts,
         folders,
         context,
         notes: items,
         total,
         selected_note,
-    })
+    };
+    perf::event("tui.read_live_state", None, started, "ok");
+    Ok(read)
 }
 
 fn session_context_for_data(
@@ -13692,5 +14045,237 @@ mod tests {
         app.handle_key(KeyEvent::from(KeyCode::Char('s')));
         assert!(!path.exists());
         let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn startup_live_refresh_does_not_block_cached_ui() {
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let counts = MutationCounts::default();
+        let backend = BlockingRefreshBackend {
+            inner: demo_backend(),
+            started: Mutex::new(Some(started_sender)),
+            release: Mutex::new(Some(release_receiver)),
+            counts,
+        };
+        let mut app = App::demo();
+        app.refresh();
+        app.backend = Arc::new(Mutex::new(Box::new(backend)));
+        app.start_initial_refresh();
+        started_receiver.recv().unwrap();
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('?')));
+        assert!(app.show_help);
+        assert!(!app.notes.is_empty());
+
+        release_sender.send(()).unwrap();
+        for _ in 0..100 {
+            app.poll_periodic_refresh();
+            if matches!(app.periodic_refresh, PeriodicRefreshState::Idle) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(matches!(app.data_source, DataSourceState::Live));
+    }
+
+    #[test]
+    fn cached_navigation_remains_responsive_during_long_periodic_refresh() {
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let counts = MutationCounts::default();
+        let backend = BlockingRefreshBackend {
+            inner: demo_backend(),
+            started: Mutex::new(Some(started_sender)),
+            release: Mutex::new(Some(release_receiver)),
+            counts,
+        };
+        let mut app = App::demo();
+        app.refresh();
+        let folder_id = app.selected_folder_id().cloned().expect("folder");
+        let retained = app.notes.clone();
+        app.folder_notes_cache.insert(folder_id, retained.clone());
+        app.backend = Arc::new(Mutex::new(Box::new(backend)));
+        app.start_initial_refresh();
+        started_receiver.recv().unwrap();
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('?')));
+        assert_eq!(app.notes, retained);
+        assert!(app.show_help);
+        assert!(app.selected_note_id().is_some());
+
+        release_sender.send(()).unwrap();
+        app.poll_periodic_refresh();
+    }
+
+    #[test]
+    fn latest_navigation_survives_periodic_backend_contention() {
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let backend = BlockingRefreshBackend {
+            inner: demo_backend(),
+            started: Mutex::new(Some(started_sender)),
+            release: Mutex::new(Some(release_receiver)),
+            counts: MutationCounts::default(),
+        };
+        let mut app = App::demo();
+        app.refresh();
+        app.backend = Arc::new(Mutex::new(Box::new(backend)));
+        app.start_initial_refresh();
+        started_receiver.recv().unwrap();
+
+        let ids: Vec<_> = app.notes.iter().map(|note| note.id.clone()).collect();
+        for id in ids.iter().take(4) {
+            app.queue_navigation_request(NavigationRequest::Preview(id.clone()));
+        }
+        assert!(matches!(
+            app.pending_navigation,
+            Some(NavigationRequest::Preview(ref id)) if id == &ids[3]
+        ));
+
+        assert!(matches!(
+            app.pending_navigation,
+            Some(NavigationRequest::Preview(ref id)) if id == &ids[3]
+        ));
+        drop(release_sender);
+    }
+
+    #[test]
+    fn live_mode_preview_cache_miss_is_async() {
+        let (mut app, _counts, cache) = create_cache_app(false, None);
+        cache.lock().unwrap().full_notes.clear();
+        app.load_selected_note();
+        assert!(app.navigation_worker.is_some());
+        app.poll_navigation_worker();
+    }
+
+    #[test]
+    fn live_mode_folder_cache_miss_is_async() {
+        let (mut app, _counts, cache) = create_cache_app(false, None);
+        cache.lock().unwrap().bootstrap.notes.clear();
+        app.load_notes_for_browsing();
+        assert!(app.navigation_worker.is_some());
+        app.poll_navigation_worker();
+    }
+
+    #[test]
+    fn rapid_note_selection_coalesces_to_latest_preview() {
+        let (mut app, _counts, cache) = create_cache_app(false, None);
+        cache.lock().unwrap().full_notes.clear();
+        let first = app.visible_note(0).unwrap().id.clone();
+        app.start_preview_worker(first);
+        let ids: Vec<_> = app.notes.iter().map(|note| note.id.clone()).collect();
+        for id in ids.iter().skip(1).take(3) {
+            app.queue_navigation_request(NavigationRequest::Preview(id.clone()));
+        }
+        assert!(matches!(
+            app.pending_navigation,
+            Some(NavigationRequest::Preview(ref id)) if id == ids.get(3).unwrap()
+        ));
+    }
+
+    #[test]
+    fn rapid_ten_note_navigation_executes_only_inflight_and_latest_preview() {
+        let (mut app, _counts, cache) = create_cache_app(false, None);
+        cache.lock().unwrap().full_notes.clear();
+        let ids: Vec<_> = app.notes.iter().map(|note| note.id.clone()).collect();
+        let first = ids[0].clone();
+        app.start_preview_worker(first);
+        for id in ids.iter().skip(1) {
+            app.queue_navigation_request(NavigationRequest::Preview(id.clone()));
+        }
+        assert!(matches!(
+            app.pending_navigation,
+            Some(NavigationRequest::Preview(ref id)) if id == ids.last().unwrap()
+        ));
+    }
+
+    #[test]
+    fn startup_refresh_suppresses_immediate_periodic_refresh() {
+        let mut app = App::demo();
+        app.set_refresh_interval(Duration::from_secs(60));
+        app.refresh();
+        let t0 = Instant::now();
+        app.start_initial_refresh();
+        app.periodic_refresh_at(t0 + Duration::from_secs(30));
+        assert!(matches!(
+            app.periodic_refresh,
+            PeriodicRefreshState::InFlight { .. }
+        ));
+    }
+
+    #[test]
+    fn periodic_refresh_interval_is_measured_from_refresh_request() {
+        let mut app = App::demo();
+        app.set_refresh_interval(Duration::from_secs(60));
+        app.refresh();
+        let t0 = Instant::now();
+        app.start_refresh_worker(t0, RefreshOrigin::Automatic);
+        assert!(app.last_refresh_attempt >= t0);
+        assert!(app.last_refresh_attempt < t0 + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn manual_refresh_remains_allowed_before_periodic_deadline() {
+        let mut app = App::demo();
+        app.set_refresh_interval(Duration::from_secs(60));
+        app.refresh();
+        app.start_initial_refresh();
+        app.pending_foreground_intent = None;
+        app.start_manual_refresh();
+        assert!(matches!(
+            app.periodic_refresh,
+            PeriodicRefreshState::InFlight { .. }
+        ));
+    }
+
+    #[test]
+    fn revisiting_loaded_folder_uses_session_cache_before_backend() {
+        let mut app = App::demo();
+        app.refresh();
+        let folder_id = app.selected_folder_id().cloned().expect("folder");
+        let retained = app.notes.clone();
+        app.folder_notes_cache.insert(folder_id, retained.clone());
+        app.load_notes_for_browsing();
+        assert_eq!(app.notes, retained);
+    }
+
+    #[test]
+    fn authoritative_folder_refresh_replaces_retained_rows() {
+        let mut app = App::demo();
+        app.refresh();
+        let folder_id = app.selected_folder_id().cloned().expect("folder");
+        let replacement = app.notes.clone();
+        app.folder_notes_cache.insert(folder_id.clone(), vec![]);
+        app.folder_notes_cache
+            .insert(folder_id, replacement.clone());
+        assert_eq!(app.folder_notes_cache.values().next(), Some(&replacement));
+    }
+
+    #[test]
+    fn repeated_folder_navigation_reuses_retained_rows() {
+        let mut app = App::demo();
+        app.refresh();
+        let folder_id = app.selected_folder_id().cloned().expect("folder");
+        let retained = app.notes.clone();
+        app.folder_notes_cache.insert(folder_id, retained.clone());
+        app.load_notes_for_browsing();
+        let first = app.notes.clone();
+        app.load_notes_for_browsing();
+        assert_eq!(first, retained);
+        assert_eq!(app.notes, retained);
+    }
+
+    #[test]
+    fn stale_folder_result_cannot_overwrite_newer_retained_rows() {
+        let mut app = App::demo();
+        app.refresh();
+        let folder_id = app.selected_folder_id().cloned().expect("folder");
+        let newer = app.notes.clone();
+        app.folder_notes_cache
+            .insert(folder_id.clone(), newer.clone());
+        let stale = newer.first().cloned().into_iter().collect::<Vec<_>>();
+        assert_eq!(app.folder_notes_cache.get(&folder_id), Some(&newer));
+        assert_ne!(stale, newer);
     }
 }

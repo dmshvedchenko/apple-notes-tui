@@ -8,6 +8,7 @@ use crossterm::{
 };
 use notes_bridge::AppleScriptNotesBackend;
 use notes_cache::SqliteNotesCache;
+use notes_core::perf;
 use notes_tui::{
     clear_editor_draft, config_path, edit_config, editor_draft_path, format_editor_draft_info,
     load_editor_draft, load_session, parse_config_edit_command, parse_config_overrides,
@@ -18,6 +19,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 const HELP: &str = "apple-notes-tui [--demo|--help|--version|--cache-info|--cache-clear|--config-info|--draft-info|--draft-clear]\n\nConfiguration overrides: --refresh-interval <seconds>, --auto-refresh|--no-auto-refresh, --preview-wrap|--no-preview-wrap, --show-attachment-metadata|--hide-attachment-metadata\n\nConfig editing: --config-set <refresh_interval_seconds|auto_refresh|preview_wrap|show_attachment_metadata>=<value>, --config-unset <key>, --config-reset\n\nMaintenance commands: --cache-info, --cache-clear, --config-info, --draft-info, --draft-clear. Draft commands are standalone local-only operations.\n\nApple Notes terminal frontend.";
 
 fn main() -> io::Result<()> {
+    let startup_started = Instant::now();
     let args: Vec<_> = std::env::args().skip(1).collect();
     if let Some(command) = parse_draft_cli_command(&args)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
@@ -167,9 +169,28 @@ fn main() -> io::Result<()> {
         }
     }
     app.bootstrap_cache();
+    perf::event(
+        "startup.cached_data_ready",
+        None,
+        startup_started,
+        "complete",
+    );
     let mut terminal = TerminalSession::enter()?;
-    app.refresh();
     app.offer_editor_draft_recovery();
+    terminal.terminal.draw(|frame| render(frame, &app))?;
+    perf::event(
+        "startup.first_frame_ready",
+        None,
+        startup_started,
+        "complete",
+    );
+    app.start_initial_refresh();
+    perf::event(
+        "startup.live_refresh_started",
+        None,
+        startup_started,
+        "background=true",
+    );
     loop {
         app.poll_periodic_refresh();
         terminal.terminal.draw(|frame| render(frame, &app))?;
@@ -178,7 +199,19 @@ fn main() -> io::Result<()> {
         }
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
+                let started = Instant::now();
                 app.handle_key(key);
+                let elapsed = started.elapsed();
+                if elapsed >= Duration::from_millis(16) {
+                    let category = if elapsed >= Duration::from_millis(100) {
+                        "slow_100ms"
+                    } else if elapsed >= Duration::from_millis(50) {
+                        "slow_50ms"
+                    } else {
+                        "slow_16ms"
+                    };
+                    perf::event("ui.key_handler", None, started, category);
+                }
             }
         }
         app.periodic_refresh_at(Instant::now());

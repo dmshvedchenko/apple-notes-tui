@@ -11,6 +11,7 @@ use std::sync::{atomic::AtomicBool, Mutex};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod perf;
 pub mod rich_text;
 pub use rich_text::{
     parse_notes_html, serialize_notes_html, Block, Inline, ListItem, RichDocument, RichFeature,

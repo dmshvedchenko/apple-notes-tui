@@ -11,6 +11,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use notes_core::perf;
 use notes_core::{
     Account, AccountId, AttachmentCapabilities, AttachmentExportResult, AttachmentId,
     AttachmentMetadata, AttachmentSummary, BackendCapabilities, CreateChildFolder, CreateFolder,
@@ -39,8 +40,16 @@ impl AppleScriptNotesBackend {
         operation: &str,
         arguments: Vec<String>,
     ) -> Result<T, NotesError> {
-        let output = run_osascript(operation, &arguments)?;
-        decode_probe_response(operation, &output)
+        let started = Instant::now();
+        let result = run_osascript(operation, &arguments)
+            .and_then(|output| decode_probe_response(operation, &output));
+        perf::event(
+            "bridge.osascript",
+            Some(operation),
+            started,
+            if result.is_ok() { "ok" } else { "error" },
+        );
+        result
     }
 
     fn call_with_cancel<T: for<'a> Deserialize<'a>>(
@@ -49,8 +58,20 @@ impl AppleScriptNotesBackend {
         arguments: Vec<String>,
         cancel: Option<&AtomicBool>,
     ) -> Result<T, NotesError> {
-        let output = run_osascript_with_cancel(operation, &arguments, cancel)?;
-        decode_probe_response(operation, &output)
+        let started = Instant::now();
+        let result = run_osascript_with_cancel(operation, &arguments, cancel)
+            .and_then(|output| decode_probe_response(operation, &output));
+        perf::event(
+            "bridge.osascript",
+            Some(operation),
+            started,
+            match &result {
+                Ok(_) => "ok",
+                Err(NotesError::Cancelled) => "cancelled",
+                Err(_) => "error",
+            },
+        );
+        result
     }
 }
 

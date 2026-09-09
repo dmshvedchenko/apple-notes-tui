@@ -454,6 +454,29 @@ retry after it finishes. A foreground action can in turn cancel either
 read-only worker; create, edit, move, delete, and attachment operations remain
 the existing synchronous foreground paths after backend ownership is released.
 
+Startup live reconciliation is also non-blocking. The TUI restores the derived
+cache, renders a usable first frame, and then schedules exactly one background
+`accounts` -> `folders` -> `notes` read. Cached navigation remains usable while
+the result is in flight; the UI thread applies the authoritative result and
+persists the derived snapshot when it arrives. A startup read failure preserves
+valid cached data and enters the existing backend-unavailable state. The
+periodic timer does not launch a duplicate startup traversal.
+
+Ordinary live browsing is cache-first as well. Folder activation presents
+cached rows for the exact stable FolderId before scheduling the authoritative
+Notes read. Selecting a note presents its cached full preview immediately and
+refreshes it in the background. Only one navigation read is active; rapid
+selection coalesces to the latest NoteId and stale folder/preview results are
+discarded by stable IDs and generations. Notes.app remains authoritative, and
+live results are reconciled and cached on the UI thread.
+
+Visited folder summary rows are retained in memory by stable `FolderId` during
+the session, so returning to a folder can reuse its cached presentation while
+the authoritative validation read runs. Startup, periodic, and manual refresh
+requests are distinguished in opt-in performance tracing; startup establishes
+the next periodic deadline instead of triggering an immediate duplicate full
+refresh.
+
 CREATE and normal saves of existing notes use one short-lived worker: the editor is
 temporarily frozen while it reads for conflict detection and performs the
 ordinary update. The UI thread receives the result and calls `finish_saved`, so
@@ -564,3 +587,16 @@ the depth-first navigation while retaining the selected folder/note, search,
 preview scroll, and focus. Snapshot persistence is warning-only after success;
 session continuity IDs do not change, so no session rewrite is needed. There is
 no drag/drop, cross-account reparent, rollback, or replay.
+
+### Phase 15 A2.4c — deterministic refresh and retention closure
+
+The periodic interval is measured from the refresh request, preventing an
+immediate duplicate automatic traversal after startup or a manual refresh.
+Manual refresh remains available before the periodic deadline. Loaded folder
+summary rows are retained by stable `FolderId`, replaced only by an
+authoritative live folder result, and invalidated by note/folder mutations.
+Navigation workers apply only current-generation results, so stale folder or
+preview reads cannot overwrite newer runtime state. The current-context
+refresh sequence remains accounts -> folders -> notes -> selected preview ->
+attachments; cache writes remain on the UI thread. No global mirror,
+NoteStore access, or transport/process optimization was added.
