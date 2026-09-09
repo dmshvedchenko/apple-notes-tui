@@ -1,0 +1,10 @@
+{
+  "schemaVersion": "apple-notes-probe/v1",
+  "operation": "get-note",
+  "ok": false,
+  "error": {
+    "source": "AppleScript",
+    "code": "404",
+    "message": "note not found: fixture-note-id"
+  }
+}

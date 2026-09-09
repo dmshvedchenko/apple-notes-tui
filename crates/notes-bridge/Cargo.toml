@@ -1,0 +1,12 @@
+[package]
+name = "notes-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Apple Events implementation of notes-core::NotesBackend"
+license = "MIT"
+publish = false
+
+[dependencies]
+notes-core = { path = "../notes-core" }
+serde.workspace = true
+serde_json.workspace = true

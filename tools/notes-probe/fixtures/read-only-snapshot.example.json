@@ -1,0 +1,32 @@
+{
+  "schemaVersion": "apple-notes-probe/v1",
+  "operation": "snapshot",
+  "ok": true,
+  "data": {
+    "accounts": [
+      {
+        "id": "fixture-account-id",
+        "name": "iCloud",
+        "upgraded": true,
+        "default": true,
+        "defaultFolderId": "fixture-folder-id"
+      }
+    ],
+    "folders": [
+      {
+        "id": "fixture-folder-id",
+        "name": "Notes",
+        "accountId": "fixture-account-id",
+        "parentKind": "account",
+        "parentId": "fixture-account-id",
+        "shared": false
+      }
+    ],
+    "notes": {
+      "items": [],
+      "returned": 0,
+      "total": 0,
+      "truncated": false
+    }
+  }
+}

@@ -1,0 +1,21 @@
+[package]
+name = "notes-tui"
+version = "0.1.0"
+edition = "2021"
+description = "Ratatui terminal frontend for Apple Notes"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "apple-notes-tui"
+path = "src/main.rs"
+
+[dependencies]
+crossterm.workspace = true
+notes-bridge = { path = "../notes-bridge" }
+notes-core = { path = "../notes-core" }
+notes-cache = { path = "../notes-cache" }
+ratatui.workspace = true
+unicode-width.workspace = true
+serde.workspace = true
+serde_json.workspace = true

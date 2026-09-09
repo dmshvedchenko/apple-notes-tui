@@ -1,0 +1,12 @@
+{
+  "schemaVersion": "apple-notes-probe/v1",
+  "operation": "create-note",
+  "ok": true,
+  "dryRun": true,
+  "data": {
+    "action": "create-note",
+    "folderId": "fixture-folder-id",
+    "name": "Phase 0 fixture",
+    "bodyBytes": 122
+  }
+}

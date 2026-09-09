@@ -1,0 +1,14 @@
+[package]
+name = "notes-core"
+version = "0.1.0"
+edition = "2021"
+description = "Typed domain model and backend abstraction for Apple Notes"
+license = "MIT"
+publish = false
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

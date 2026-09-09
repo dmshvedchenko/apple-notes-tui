@@ -1,0 +1,12 @@
+/target/
+/tools/notes-probe/target/
+/tools/notes-probe/notes-probe
+*.scpt
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Local AI coding-assistant instructions
+/AGENTS.md
+/sources/

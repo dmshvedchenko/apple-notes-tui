@@ -1,0 +1,9 @@
+[package]
+name = "notes-probe"
+version = "0.1.0"
+edition = "2021"
+description = "Phase 0 Apple Notes AppleScript capability probe"
+license = "MIT"
+publish = false
+
+[dependencies]
