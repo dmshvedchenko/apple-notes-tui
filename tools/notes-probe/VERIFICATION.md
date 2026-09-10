@@ -1208,3 +1208,198 @@ and preview results. The refresh traversal remains accounts -> folders ->
 notes -> selected preview -> attachments; no cache or transport scope was
 expanded. Tests use injected clocks/state and do not sleep or perform real
 Notes.app mutations.
+
+## Phase 17 A1 — read-path profiling and low-risk optimization
+
+The embedded read path was audited: accounts and folders enumerate the public
+Notes scripting hierarchy; notes returns summary metadata; get-note resolves a
+stable NoteId and reads the body; attachments separately resolves that NoteId
+and reads attachment metadata. The notes-list handler now requests attachment
+counts rather than every attachment object, preserving the `NoteSummary`
+contract while avoiding unnecessary list payload work. Full attachment
+metadata remains available for selected previews and explicit attachment
+actions.
+
+The bridge now uses one read-only `preview` osascript process for the selected
+note body and attachment metadata; explicit attachment preview/export remains
+separate and on-demand. No concurrent reads, daemon, schema change, or
+mutation path was introduced. A 20-sample local `/usr/bin/osascript -e
+'return "ok"'` baseline measured approximately 136 ms minimum, 147 ms median,
+155 ms p90, and 295 ms maximum. Notes.app timings were not collected because
+Automation access is unavailable in this environment; no values are
+fabricated. No NoteStore access or real Notes.app mutation was performed.
+
+## Phase 17 A1c — combined preview benchmark
+
+The privacy-safe benchmark command is:
+
+```bash
+NOTE_ID='x-coredata://REPLACE_WITH_A_READ_ONLY_STABLE_NOTE_ID'
+for i in $(seq 1 20); do
+  /usr/bin/time -p ./tools/notes-probe/target/release/notes-probe preview \
+    --note-id "$NOTE_ID" >/dev/null
+done 2>&1 | awk '/^real / { print $2 }'
+```
+
+The `preview` probe is read-only and returns the full note plus attachment
+metadata in one operation; redirecting stdout keeps note content and filenames
+out of benchmark output. Notes Automation was unavailable in this validation
+environment, so no NoteId was obtained and no live timing was fabricated.
+
+## Phase 17 A1g — serializer diagnostics
+
+`jsonString` now performs one character traversal into a fragment list and one
+`joinText` operation. It no longer performs repeated full-string replacement
+passes. Diagnostic stages cover metadata, body, plaintext, body-plus-plaintext,
+serialized note, serialized attachments, and full preview. The plaintext stage
+initializes and serializes its local plaintext value; `attachment-count` returns
+an opaque ID plus numeric count. These probes remain read-only and preserve the
+existing preview wire shape.
+
+## Phase 17 A1i.1 — Foundation object-graph isolation
+
+All preview-stage diagnostics now build native Foundation dictionaries and
+arrays and serialize once with `NSJSONSerialization`; they no longer use the
+legacy per-field serializer. Three Notes-independent probes isolate the
+remaining non-Notes work using fixed local values:
+
+```text
+notes-probe foundation-graph-only
+notes-probe foundation-serialize-only
+notes-probe foundation-full-local
+```
+
+`foundation-graph-only` constructs the complete preview-shaped graph without
+serialization, `foundation-serialize-only` measures the same graph plus one
+serialization, and `foundation-full-local` includes UTF-8 string conversion.
+The local graph contains an empty attachments array and JSON booleans. No
+probe accesses Notes.app, performs mutations, or accesses NoteStore. Production
+zero-attachment preview uses three dictionaries, one array, sixteen
+`setObject` calls, two NSNumber values, one `NSJSONSerialization` call, and one
+NSData-to-NSString conversion.
+
+## Phase 17 A1j — metadata Apple Events diagnostics
+
+The preview prelude resolves one stable NoteId through `findNoteContext`, which
+already returns the account and folder IDs as local values. Production preview
+reuses those IDs and does not reread the note ID, account ID, or folder ID after
+resolution. The remaining scalar metadata reads are name, creation date,
+modification date, password-protected, and shared, followed by local date text
+conversion and Foundation graph construction.
+
+The following read-only incremental probes serialize actual values once:
+
+```text
+preview-meta-id
+preview-meta-name
+preview-meta-account-folder
+preview-meta-created
+preview-meta-modified
+preview-meta-protection
+preview-meta-shared
+preview-meta-all
+preview-meta-properties
+```
+
+`preview-meta-properties` exercises the public Notes `properties of noteRef`
+record without changing production behavior. Its returned field availability
+must be measured on a permitted Notes.app fixture; no private NoteStore access
+or real mutation is used here. Body, plaintext, attachments, and Foundation
+serialization remain unchanged in this pass.
+
+`preview-meta-properties-shape` performs exactly one public `properties of
+noteRef` read and returns only field presence/type metadata, never title, body,
+plaintext, attachment names, or URLs. `preview-meta-properties-all` reads
+metadata from the returned local record and reuses the context's authoritative
+NoteId/account/folder IDs. `preview-properties-full` is diagnostic-only and is
+not used by production preview. Production remains on the scalar control path
+until an interleaved same-session benchmark and permitted fixture confirm the
+record shape and performance.
+
+Interleaved privacy-safe comparison (20 pairs, alternating order):
+
+```bash
+for i in $(seq 1 20); do
+  if [ $((i % 2)) -eq 1 ]; then
+    /usr/bin/time -p ./tools/notes-probe/target/release/notes-probe preview-meta-all --note-id "$NOTE_ID" >/dev/null 2>>/tmp/meta-a
+    /usr/bin/time -p ./tools/notes-probe/target/release/notes-probe preview-meta-properties-all --note-id "$NOTE_ID" >/dev/null 2>>/tmp/meta-b
+  else
+    /usr/bin/time -p ./tools/notes-probe/target/release/notes-probe preview-meta-properties-all --note-id "$NOTE_ID" >/dev/null 2>>/tmp/meta-b
+    /usr/bin/time -p ./tools/notes-probe/target/release/notes-probe preview-meta-all --note-id "$NOTE_ID" >/dev/null 2>>/tmp/meta-a
+  fi
+done
+```
+
+Run equivalent alternating pairs for `preview` versus
+`preview-properties-full`, and `lookup` versus `preview-meta-id`; analyze only
+the redirected timing streams, never the JSON payloads.
+
+## Phase 17 A1l — production bulk preview
+
+Measured interleaved macOS results showed the bulk metadata path faster in 20/20
+pairs and the bulk full-preview path faster in 19/20 pairs. Production
+`preview` now performs one `properties of noteRef` snapshot, extracts all
+metadata/body/plaintext fields from the local record, reads the attachment
+element collection separately, and serializes the unchanged Foundation wire
+object once. `findNoteContext` remains the source of stable NoteId, account ID,
+and folder ID. No fallback path was added; successful bulk reads are direct and
+there are no duplicate scalar reads.
+
+## Phase 17 A1m — contextual lookup diagnostics
+
+Diagnostic-only contextual commands now accept known stable IDs:
+
+```text
+notes-probe lookup-contextual --note-id ID --account-id ID --folder-id ID
+notes-probe preview-contextual --note-id ID --account-id ID --folder-id ID
+```
+
+The lookup constrains traversal to the supplied account and folder, validates
+the stable NoteId, and returns an explicit context-mismatch error without a
+global fallback. Contextual preview preserves the A1l bulk properties snapshot,
+separate attachment collection, and one Foundation serialization. Production
+lookup and preview remain unchanged.
+
+## Phase 17 A1n.1 — contextual error classification
+
+Structured nonzero `preview-contextual` responses are decoded before generic
+transport failure handling. Only the explicit AppleScript 404 context-mismatch
+message maps to `NotesError::ContextMismatch` and schedules one global preview
+fallback. Unrelated 404s, parser failures, permission errors, and transport
+errors do not trigger fallback. Contextual perf logging records stable IDs and
+fallback decisions only; note content is never logged.
+## Phase 17 A1n — contextual production preview
+
+Selected TUI previews now carry the summary FolderId and derive its AccountId
+from the loaded folder tree. The bridge attempts one bounded
+`preview-contextual` read and falls back exactly once to global `preview` only
+for an explicit context mismatch. Successful contextual and fallback previews
+retain the A1l bulk properties snapshot, one attachment collection, and one
+Foundation serialization. Stable NoteId remains authoritative; production
+mutations and cache schema are unchanged.
+## Phase 17 A1n.3 — no attachment reads in list hot path
+
+The `notes` and `snapshot` producers perform zero attachment reads. The summary
+protocol intentionally omits `attachmentCount`; Rust models this as
+`Option<usize>`, where `None` means not loaded. Full preview remains exact by
+deriving the count from `attachments.len()`. The targeted `attachment-count`
+diagnostic remains available and no scan-all diagnostic is retained.
+## Phase 17 A1n.4 — contextual invocation parity
+
+The production bridge and `notes-probe` use the identical positional contract:
+`preview-contextual`, `noteId`, `accountId`, `folderId`. The production bridge
+resolves the executable-adjacent `scripts/notes_probe.applescript` sidecar,
+falls back to the embedded canonical source only when the sidecar is absent,
+and logs final spawn arguments plus safe error kinds under
+`APPLE_NOTES_TUI_PERF=1`. Context mismatch classification and one global
+fallback remain unchanged.
+
+## Phase 17 A1o — startup periodic-refresh scheduling
+
+The periodic clock is reset at successful live-refresh reconciliation, including
+the initial startup refresh. The first frame and cache bootstrap remain
+immediate, and startup live refresh remains asynchronous. A failed startup
+refresh does not count as successful and remains eligible for the existing retry
+policy. Deterministic tests cover the pre-interval/not-due state, configured
+interval due state, failed refresh behavior, and preservation of manual and
+mutation-triggered refresh paths.

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.2 - 2026-09-10
+
+### Changed
+
+- Significantly faster note preview and navigation through bounded contextual
+  lookup and consolidated Notes property reads.
+- Cache-first startup remains immediate, with no redundant periodic refresh
+  immediately after successful startup reconciliation.
+- AppleScript sidecar execution is consistent between the probe and TUI.
+
+### Fixed
+
+- Contextual preview response decoding and narrow stale-context fallback.
+- Notes-list attachment-count regressions and timeouts; exact attachment counts
+  remain available when a full preview is loaded.
+
 ## 0.1.1 - 2026-09-09
 
 ### Changed

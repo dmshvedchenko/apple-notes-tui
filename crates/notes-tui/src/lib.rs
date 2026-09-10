@@ -1069,7 +1069,13 @@ enum NavigationWorkerResult {
 }
 
 enum NavigationRequest {
+    #[allow(dead_code)]
     Preview(NoteId),
+    PreviewContextual {
+        id: NoteId,
+        account_id: Option<AccountId>,
+        folder_id: Option<FolderId>,
+    },
     Folder(RefreshContext),
 }
 
@@ -1845,7 +1851,16 @@ impl App {
             preferred,
             None,
         ) {
-            Ok(read) => self.apply_live_refresh_read(read),
+            Ok(read) => {
+                self.apply_live_refresh_read(read);
+                self.last_refresh_attempt = Instant::now();
+                perf::event(
+                    "tui.live_refresh_clock_reset",
+                    None,
+                    Instant::now(),
+                    "successful_sync_refresh",
+                );
+            }
             Err(error) => self.set_error(error),
         }
     }
@@ -1947,6 +1962,13 @@ impl App {
                 match *result {
                     Ok(read) => {
                         self.apply_live_refresh_read(read);
+                        self.last_refresh_attempt = Instant::now();
+                        perf::event(
+                            "tui.live_refresh_clock_reset",
+                            None,
+                            Instant::now(),
+                            "successful_worker_refresh",
+                        );
                         perf::event("startup.live_reconciled", None, Instant::now(), "complete");
                     }
                     Err(NotesError::Cancelled) => {}
@@ -2053,6 +2075,11 @@ impl App {
         };
         match request {
             NavigationRequest::Preview(id) => self.start_preview_worker(id),
+            NavigationRequest::PreviewContextual {
+                id,
+                account_id,
+                folder_id,
+            } => self.start_preview_worker_with_context(id, account_id, folder_id),
             NavigationRequest::Folder(context) => self.start_folder_worker(context),
         }
     }
@@ -2063,7 +2090,35 @@ impl App {
         self.pending_navigation = Some(request);
     }
 
+    fn queue_preview_request(&mut self, id: NoteId) {
+        let folder_id = self
+            .notes
+            .iter()
+            .find(|summary| summary.id == id)
+            .map(|summary| summary.folder_id.clone());
+        let account_id = folder_id.as_ref().and_then(|folder_id| {
+            self.folders
+                .iter()
+                .find(|folder| folder.id == *folder_id)
+                .map(|folder| folder.account_id.clone())
+        });
+        self.queue_navigation_request(NavigationRequest::PreviewContextual {
+            id,
+            account_id,
+            folder_id,
+        });
+    }
+
     fn start_preview_worker(&mut self, id: NoteId) {
+        self.start_preview_worker_with_context(id, None, None);
+    }
+
+    fn start_preview_worker_with_context(
+        &mut self,
+        id: NoteId,
+        account_id: Option<AccountId>,
+        folder_id: Option<FolderId>,
+    ) {
         self.navigation_generation = self.navigation_generation.wrapping_add(1);
         let generation = self.navigation_generation;
         let backend = Arc::clone(&self.backend);
@@ -2071,7 +2126,13 @@ impl App {
         let worker_id = id.clone();
         thread::spawn(move || {
             let result = catch_unwind(AssertUnwindSafe(|| {
-                backend.lock().unwrap().get_note(&worker_id)
+                let guard = backend.lock().unwrap();
+                match (account_id.as_ref(), folder_id.as_ref()) {
+                    (Some(account_id), Some(folder_id)) => {
+                        guard.get_note_with_context(&worker_id, account_id, folder_id)
+                    }
+                    _ => guard.get_note(&worker_id),
+                }
             }));
             let result = match result {
                 Ok(result) => result,
@@ -5476,7 +5537,7 @@ impl App {
                         self.selected_note = Some(note);
                         self.preview_scroll = 0;
                         if matches!(self.data_source, DataSourceState::Live) {
-                            self.queue_navigation_request(NavigationRequest::Preview(id.clone()));
+                            self.queue_preview_request(id.clone());
                             self.start_pending_navigation();
                             perf::event(
                                 "navigation.preview.cache_hit",
@@ -5498,7 +5559,7 @@ impl App {
                     perf::event("tui.preview_cached", Some(id.as_str()), started, "complete");
                     return;
                 }
-                self.queue_navigation_request(NavigationRequest::Preview(id.clone()));
+                self.queue_preview_request(id.clone());
                 self.start_pending_navigation();
                 perf::event(
                     "navigation.preview.cache_miss",
@@ -6311,25 +6372,10 @@ fn settings_popup_text(settings: &SettingsState, app: &App) -> String {
     format!("Settings (changes apply next startup)\n\n{rows}\n\n{detail}")
 }
 fn preview_text(note: &Note, show_attachment_metadata: bool) -> Text<'static> {
-    let lock = if note.summary.password_protected {
-        "[locked] Password protected"
-    } else {
-        "Unlocked"
-    };
     let mut lines = vec![
         Line::from(Span::styled(
             note.summary.name.clone(),
             Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(format!(
-            "Folder: {} | Account: {}",
-            note.summary.folder_id, note.account_id
-        )),
-        Line::from(format!("Created: {}", note.summary.creation_date)),
-        Line::from(format!("Modified: {}", note.summary.modification_date)),
-        Line::from(format!(
-            "Shared: {} | {lock} | Attachments: {}",
-            note.summary.shared, note.summary.attachment_count
         )),
         Line::from(""),
     ];
@@ -6611,7 +6657,7 @@ pub fn demo_backend() -> MockNotesBackend {
         demo_attachment("demo-pdf", "demo-attachment", "Manual.pdf"),
         demo_attachment("demo-unknown", "demo-attachment", "Opaque payload"),
     ];
-    attachment_note.summary.attachment_count = attachment_note.attachments.len();
+    attachment_note.summary.attachment_count = Some(attachment_note.attachments.len());
 
     let mut locked_attachment =
         demo_attachment("demo-locked-file", "demo-locked-attachment", "Locked.pdf");
@@ -6749,7 +6795,7 @@ fn demo_html_note(
     attachment_count: usize,
 ) -> Note {
     let mut note = demo_note(id, folder_id, name, "");
-    note.summary.attachment_count = attachment_count;
+    note.summary.attachment_count = Some(attachment_count);
     note.body_html = body_html.into();
     note.plaintext = body_html.replace(['<', '>'], " ");
     note
@@ -6765,7 +6811,7 @@ fn demo_note(id: &str, folder_id: &str, name: &str, plaintext: &str) -> Note {
             modification_date: date,
             password_protected: false,
             shared: false,
-            attachment_count: 0,
+            attachment_count: Some(0),
         },
         account_id: AccountId::from("demo-account"),
         body_html: format!("<div>{plaintext}</div>"),
@@ -12471,6 +12517,38 @@ mod tests {
         assert!(!app.preview_wrap);
     }
 
+    #[test]
+    fn normal_preview_omits_internal_metadata_but_keeps_title_body_and_attachments() {
+        let mut app = App::demo();
+        app.refresh();
+        select_demo_note(&mut app, "demo-attachment");
+        let note = app.selected_note.as_ref().unwrap();
+        let rendered = preview_text(note, false)
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(rendered.contains("Attachment example"));
+        assert!(rendered.contains("Attachment preview is read-only"));
+        assert!(rendered.contains("Photo.png"));
+        for technical in [
+            "Folder:",
+            "Account:",
+            "Created:",
+            "Modified:",
+            "Shared:",
+            "Unlocked",
+            "Attachments:",
+            "x-coredata://",
+        ] {
+            assert!(
+                !rendered.contains(technical),
+                "unexpected metadata: {technical}"
+            );
+        }
+    }
+
     fn temporary_config_path(name: &str) -> PathBuf {
         std::env::temp_dir()
             .join(format!(
@@ -14202,6 +14280,32 @@ mod tests {
             app.periodic_refresh,
             PeriodicRefreshState::InFlight { .. }
         ));
+    }
+
+    #[test]
+    fn successful_startup_refresh_resets_periodic_refresh_clock() {
+        let mut app = App::demo();
+        app.set_refresh_interval(Duration::from_secs(60));
+        let completed = Instant::now();
+        app.last_refresh_attempt = completed;
+        app.refresh_due = false;
+        app.periodic_refresh_at(completed + Duration::from_secs(59));
+        assert!(!app.refresh_due);
+        app.periodic_refresh_at(completed + Duration::from_secs(60));
+        assert!(
+            app.refresh_due
+                || matches!(app.periodic_refresh, PeriodicRefreshState::InFlight { .. })
+        );
+    }
+
+    #[test]
+    fn failed_startup_refresh_does_not_mark_refresh_success() {
+        let mut app = App::demo();
+        app.set_refresh_interval(Duration::from_secs(60));
+        app.refresh_due = false;
+        let before = app.last_refresh_attempt;
+        app.set_error(NotesError::Backend("startup failure".into()));
+        assert_eq!(app.last_refresh_attempt, before);
     }
 
     #[test]

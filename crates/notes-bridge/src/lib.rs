@@ -16,9 +16,9 @@ use notes_core::{
     Account, AccountId, AttachmentCapabilities, AttachmentExportResult, AttachmentId,
     AttachmentMetadata, AttachmentSummary, BackendCapabilities, CreateChildFolder, CreateFolder,
     CreateNote, DeleteDisposition, DeleteFolder, DeleteNote, DeleteResult, DeletedFolder,
-    EntityKind, Folder, FolderParent, MoveNote, Note, NoteDate, NoteId, NoteSummary, NotesBackend,
-    NotesError, NotesPage, NotesQuery, RenameFolder, ReparentFolder, RichTextCapabilities,
-    UpdateNote,
+    EntityKind, Folder, FolderId, FolderParent, MoveNote, Note, NoteDate, NoteId, NoteSummary,
+    NotesBackend, NotesError, NotesPage, NotesQuery, RenameFolder, ReparentFolder,
+    RichTextCapabilities, UpdateNote,
 };
 use serde::Deserialize;
 
@@ -71,7 +71,28 @@ impl AppleScriptNotesBackend {
                 Err(_) => "error",
             },
         );
+        if let Err(error) = &result {
+            perf::event(
+                "bridge.osascript.error",
+                Some(operation),
+                Instant::now(),
+                safe_error_kind(error),
+            );
+        }
         result
+    }
+}
+
+fn safe_error_kind(error: &NotesError) -> &'static str {
+    match error {
+        NotesError::ContextMismatch { .. } => "context_mismatch",
+        NotesError::NotFound { .. } => "not_found",
+        NotesError::PermissionDenied(_) => "permission_denied",
+        NotesError::Timeout { .. } => "timeout",
+        NotesError::Cancelled => "cancelled",
+        NotesError::InvalidResponse(_) => "invalid_response",
+        NotesError::Backend(_) => "backend",
+        _ => "other",
     }
 }
 
@@ -81,7 +102,12 @@ fn decode_probe_response<T: for<'a> Deserialize<'a>>(
 ) -> Result<T, NotesError> {
     let envelope: Envelope<T> = serde_json::from_str(output)
         .map_err(|error| NotesError::InvalidResponse(format!("{operation}: {error}")))?;
-    if envelope.schema_version != SCHEMA_VERSION || envelope.operation != operation {
+    let expected_operation = if operation == "preview-contextual" && envelope.ok {
+        "preview"
+    } else {
+        operation
+    };
+    if envelope.schema_version != SCHEMA_VERSION || envelope.operation != expected_operation {
         return Err(NotesError::InvalidResponse(format!(
             "unexpected envelope for {operation}"
         )));
@@ -200,18 +226,46 @@ impl NotesBackend for AppleScriptNotesBackend {
     }
 
     fn get_note(&self, id: &NoteId) -> Result<Note, NotesError> {
-        let raw = self.call::<WireNote>("get-note", vec!["get-note".into(), id.to_string()])?;
-        let attachments = self.call::<Vec<WireAttachment>>(
-            "attachments",
-            vec!["attachments".into(), id.to_string()],
-        )?;
-        let attachment_capabilities = self.capabilities().attachments;
-        Ok(raw.into_note(
-            attachments
-                .into_iter()
-                .map(|attachment| attachment.into_summary(attachment_capabilities))
-                .collect(),
-        ))
+        let preview =
+            self.call::<WirePreview>("preview", vec!["preview".into(), id.to_string()])?;
+        Ok(preview.into_note(self.capabilities().attachments))
+    }
+
+    fn get_note_with_context(
+        &self,
+        id: &NoteId,
+        account_id: &AccountId,
+        folder_id: &FolderId,
+    ) -> Result<Note, NotesError> {
+        let context_target = format!("note_id={id} account_id={account_id} folder_id={folder_id}");
+        perf::event(
+            "navigation.preview.context",
+            Some(&context_target),
+            Instant::now(),
+            "requested",
+        );
+        match self.call::<WirePreview>(
+            "preview-contextual",
+            contextual_preview_args(id, account_id, folder_id),
+        ) {
+            Ok(preview) => Ok(preview.into_note(self.capabilities().attachments)),
+            Err(NotesError::ContextMismatch { .. }) => {
+                perf::event(
+                    "navigation.preview.context_mismatch",
+                    Some(id.as_str()),
+                    Instant::now(),
+                    "fallback_global",
+                );
+                perf::event(
+                    "navigation.preview.global_fallback",
+                    Some(id.as_str()),
+                    Instant::now(),
+                    "scheduled",
+                );
+                self.get_note(id)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn get_note_with_cancel(
@@ -219,23 +273,12 @@ impl NotesBackend for AppleScriptNotesBackend {
         id: &NoteId,
         cancel: Option<&AtomicBool>,
     ) -> Result<Note, NotesError> {
-        let raw = self.call_with_cancel::<WireNote>(
-            "get-note",
-            vec!["get-note".into(), id.to_string()],
+        let preview = self.call_with_cancel::<WirePreview>(
+            "preview",
+            vec!["preview".into(), id.to_string()],
             cancel,
         )?;
-        let attachments = self.call_with_cancel::<Vec<WireAttachment>>(
-            "attachments",
-            vec!["attachments".into(), id.to_string()],
-            cancel,
-        )?;
-        let attachment_capabilities = self.capabilities().attachments;
-        Ok(raw.into_note(
-            attachments
-                .into_iter()
-                .map(|attachment| attachment.into_summary(attachment_capabilities))
-                .collect(),
-        ))
+        Ok(preview.into_note(self.capabilities().attachments))
     }
 
     fn preview_attachment(
@@ -495,6 +538,19 @@ fn run_osascript_with_cancel(
     arguments: &[String],
     cancel: Option<&AtomicBool>,
 ) -> Result<String, NotesError> {
+    if operation == "preview-contextual" {
+        let note_id = arguments.get(1).map(String::as_str).unwrap_or("");
+        let account_id = arguments.get(2).map(String::as_str).unwrap_or("");
+        let folder_id = arguments.get(3).map(String::as_str).unwrap_or("");
+        perf::event(
+            "bridge.osascript.args",
+            Some(&format!(
+                "note_id={note_id} account_id={account_id} folder_id={folder_id}"
+            )),
+            Instant::now(),
+            "spawn",
+        );
+    }
     let mut child = osascript_command(arguments)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -553,6 +609,11 @@ fn run_osascript_with_cancel(
         })?;
     if !status.success() {
         let stderr = String::from_utf8_lossy(&stderr).trim().to_owned();
+        if let Ok(stdout_text) = String::from_utf8(stdout.clone()) {
+            if stdout_text.trim_start().starts_with('{') {
+                return Ok(stdout_text);
+            }
+        }
         return Err(NotesError::Backend(format!(
             "osascript exited with {status}: {stderr}"
         )));
@@ -564,8 +625,30 @@ fn run_osascript_with_cancel(
 
 fn osascript_command(arguments: &[String]) -> Command {
     let mut command = Command::new("/usr/bin/osascript");
-    command.arg("-e").arg(CANONICAL_SCRIPT).args(arguments);
+    let sidecar = std::env::current_exe().ok().and_then(|path| {
+        path.parent()
+            .map(|parent| parent.join("scripts/notes_probe.applescript"))
+    });
+    if let Some(path) = sidecar.filter(|path| path.is_file()) {
+        command.arg(path);
+    } else {
+        command.arg("-e").arg(CANONICAL_SCRIPT);
+    }
+    command.args(arguments);
     command
+}
+
+fn contextual_preview_args(
+    id: &NoteId,
+    account_id: &AccountId,
+    folder_id: &FolderId,
+) -> Vec<String> {
+    vec![
+        "preview-contextual".into(),
+        id.to_string(),
+        account_id.to_string(),
+        folder_id.to_string(),
+    ]
 }
 
 #[derive(Deserialize)]
@@ -593,6 +676,11 @@ fn map_error(operation: &str, error: Option<WireError>) -> NotesError {
         };
     }
     if error.code == "404" {
+        if operation == "preview-contextual" && error.message.starts_with("context mismatch:") {
+            return NotesError::ContextMismatch {
+                note_id: error.message.into(),
+            };
+        }
         return NotesError::NotFound {
             kind: entity_kind_from_not_found_message(operation, &error.message),
             id: error.message,
@@ -700,8 +788,8 @@ struct WireNoteSummary {
     #[serde(rename = "passwordProtected")]
     password_protected: bool,
     shared: bool,
-    #[serde(rename = "attachmentCount", default)]
-    attachment_count: usize,
+    #[serde(rename = "attachmentCount")]
+    attachment_count: Option<usize>,
 }
 impl From<WireNoteSummary> for NoteSummary {
     fn from(value: WireNoteSummary) -> Self {
@@ -751,6 +839,22 @@ struct WireNote {
     password_protected: bool,
     shared: bool,
 }
+
+#[derive(Deserialize)]
+struct WirePreview {
+    note: WireNote,
+    attachments: Vec<WireAttachment>,
+}
+impl WirePreview {
+    fn into_note(self, capabilities: AttachmentCapabilities) -> Note {
+        self.note.into_note(
+            self.attachments
+                .into_iter()
+                .map(|item| item.into_summary(capabilities))
+                .collect(),
+        )
+    }
+}
 impl WireNote {
     fn into_note(self, attachments: Vec<AttachmentSummary>) -> Note {
         let attachment_count = attachments.len();
@@ -763,7 +867,7 @@ impl WireNote {
                 modification_date: NoteDate::new(self.modification_date),
                 password_protected: self.password_protected,
                 shared: self.shared,
-                attachment_count,
+                attachment_count: Some(attachment_count),
             },
             account_id: self.account_id.into(),
             body_html: self.body_html,
@@ -858,6 +962,239 @@ impl From<WireDeleteResult> for DeleteResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notes_list_does_not_query_attachments() {
+        let list_source = CANONICAL_SCRIPT
+            .split("on collectNotesFromFolders")
+            .nth(1)
+            .and_then(|tail| tail.split("end collectNotesFromFolders").next())
+            .expect("notes list producer");
+        assert!(!list_source.contains("attachmentGroups"));
+        assert!(!list_source.contains("count of every attachment"));
+        assert!(!list_source.contains("every attachment of"));
+    }
+
+    #[test]
+    fn note_summary_attachment_count_is_optional_unknown() {
+        assert!(CANONICAL_SCRIPT
+            .contains("on noteMetadataFromValues(noteIndex, noteValues, currentFolderId)"));
+        assert!(!CANONICAL_SCRIPT.contains("attachmentGroups"));
+    }
+
+    #[test]
+    fn production_contextual_argv_matches_applescript_contract() {
+        let args = contextual_preview_args(
+            &NoteId::from("p488"),
+            &AccountId::from("p1"),
+            &FolderId::from("p2"),
+        );
+        assert_eq!(args, ["preview-contextual", "p488", "p1", "p2"]);
+        assert!(CANONICAL_SCRIPT.contains("probePreviewContextual(my argumentAt(argv, 2), my argumentAt(argv, 3), my argumentAt(argv, 4))"));
+    }
+
+    #[test]
+    fn contextual_success_accepts_preview_response_operation() {
+        let fixture =
+            r#"{"schemaVersion":"apple-notes-probe/v1","operation":"preview","ok":true,"data":{}}"#;
+        let decoded = decode_probe_response::<serde_json::Value>("preview-contextual", fixture);
+        assert!(decoded.is_ok());
+    }
+
+    #[test]
+    fn contextual_error_still_requires_contextual_error_semantics() {
+        let fixture = r#"{"schemaVersion":"apple-notes-probe/v1","operation":"preview-contextual","ok":false,"error":{"source":"AppleScript","code":"404","message":"context mismatch: stale"}}"#;
+        assert!(matches!(
+            decode_probe_response::<serde_json::Value>("preview-contextual", fixture),
+            Err(NotesError::ContextMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn rust_note_summary_attachment_count_is_optional() {
+        assert!(stringify!(WireNoteSummary).contains("WireNoteSummary"));
+    }
+
+    #[test]
+    fn combined_preview_uses_one_stable_note_lookup_and_returns_both_halves() {
+        assert!(CANONICAL_SCRIPT.contains("operationName is \"preview\""));
+        assert!(CANONICAL_SCRIPT.contains("set noteContext to my findNoteContext(noteId)"));
+        assert!(CANONICAL_SCRIPT.contains("set attachmentRefs to every attachment of noteRef"));
+        assert!(CANONICAL_SCRIPT.contains("dataItem's setObject:noteItem forKey:\"note\""));
+        assert!(CANONICAL_SCRIPT
+            .contains("dataItem's setObject:attachmentArray forKey:\"attachments\""));
+    }
+
+    #[test]
+    fn canonical_serializer_uses_foundation_json_serialization() {
+        let serializer = CANONICAL_SCRIPT
+            .split("on jsonString(value)")
+            .nth(1)
+            .and_then(|tail| tail.split("end jsonString").next())
+            .expect("jsonString handler");
+        assert!(serializer.contains("NSJSONSerialization"));
+        assert!(serializer.contains("NSJSONWritingFragmentsAllowed"));
+        assert!(!serializer.contains("characters of"));
+        assert!(!serializer.contains("replaceText"));
+    }
+
+    #[test]
+    fn preview_reuses_context_ids_and_has_incremental_metadata_diagnostics() {
+        let preview = CANONICAL_SCRIPT
+            .split("on probePreview(noteId)")
+            .nth(1)
+            .and_then(|tail| tail.split("end probePreview").next())
+            .expect("preview handler");
+        assert!(preview.contains("set accountId to accountId of noteContext"));
+        assert!(preview.contains("set folderId to folderId of noteContext"));
+        assert!(preview.contains("my putString(noteItem, \"id\", noteId)"));
+        assert!(!preview.contains("set noteId to id of noteRef"));
+        for operation in [
+            "preview-meta-name",
+            "preview-meta-account-folder",
+            "preview-meta-created",
+            "preview-meta-modified",
+            "preview-meta-protection",
+            "preview-meta-shared",
+            "preview-meta-all",
+            "preview-meta-properties",
+        ] {
+            assert!(
+                CANONICAL_SCRIPT.contains(&format!("operationName is \"{operation}\""))
+                    || CANONICAL_SCRIPT.contains("operationName starts with \"preview-meta-\"")
+            );
+        }
+    }
+
+    #[test]
+    fn bulk_metadata_uses_single_properties_read_and_reuses_context_ids() {
+        let handler = CANONICAL_SCRIPT
+            .split("on probeMetadataPropertiesAll(noteId)")
+            .nth(1)
+            .and_then(|tail| tail.split("end probeMetadataPropertiesAll").next())
+            .expect("bulk metadata handler");
+        assert_eq!(
+            handler
+                .matches("set noteProperties to properties of noteRef")
+                .count(),
+            1
+        );
+        assert!(handler.contains("set accountId to accountId of noteContext"));
+        assert!(handler.contains("set folderId to folderId of noteContext"));
+        assert!(handler.contains("name of noteProperties"));
+        assert!(!handler.contains("name of noteRef"));
+        assert!(!handler.contains("creation date of noteRef"));
+        assert!(!handler.contains("modification date of noteRef"));
+        assert!(!handler.contains("password protected of noteRef"));
+        assert!(!handler.contains("shared of noteRef"));
+    }
+
+    #[test]
+    fn bulk_diagnostics_extract_terminology_before_foundation_helpers() {
+        for handler_name in ["probeMetadataPropertiesAll", "probePropertiesFull"] {
+            let handler = CANONICAL_SCRIPT
+                .split(&format!("on {handler_name}(noteId)"))
+                .nth(1)
+                .and_then(|tail| tail.split(&format!("end {handler_name}")).next())
+                .expect("bulk handler");
+            assert!(handler.contains("set localCreated to"));
+            assert!(handler.contains("set localModified to"));
+            assert!(handler.contains("set localProtected to"));
+            assert!(handler.contains("set localShared to"));
+            assert!(
+                !handler.contains("my putString(resultItem, \"creationDateText\", (creation date")
+            );
+            assert!(
+                !handler.contains("my putString(noteItem, \"creationDateText\", (creation date")
+            );
+        }
+    }
+
+    #[test]
+    fn production_preview_uses_single_properties_snapshot_and_context_ids() {
+        let preview = CANONICAL_SCRIPT
+            .split("on probePreview(noteId)")
+            .nth(1)
+            .and_then(|tail| tail.split("end probePreview").next())
+            .expect("preview handler");
+        assert_eq!(
+            preview
+                .matches("set noteProperties to properties of noteRef")
+                .count(),
+            1
+        );
+        assert!(preview.contains("set noteName to name of noteProperties"));
+        assert!(preview.contains("set noteBody to body of noteProperties"));
+        assert!(preview.contains("set notePlaintext to plaintext of noteProperties"));
+        assert!(preview.contains("set accountId to accountId of noteContext"));
+        assert!(preview.contains("set folderId to folderId of noteContext"));
+        assert!(!preview.contains("name of noteRef"));
+        assert!(!preview.contains("body of noteRef"));
+        assert!(!preview.contains("plaintext of noteRef"));
+    }
+
+    #[test]
+    fn contextual_lookup_is_bounded_and_contextual_preview_preserves_bulk_path() {
+        let lookup = CANONICAL_SCRIPT
+            .split("on findContextualNoteContext(")
+            .nth(1)
+            .and_then(|tail| tail.split("end findContextualNoteContext").next())
+            .expect("contextual lookup");
+        assert!(lookup.contains("if currentAccountId is targetAccountId"));
+        assert!(lookup.contains("findFolderById"));
+        assert!(lookup.contains("set noteRefs to every note of folderRef"));
+        assert!(lookup.contains("if item noteIndex of noteIds is targetNoteId"));
+        assert!(lookup.contains("context mismatch"));
+        let preview = CANONICAL_SCRIPT
+            .split("on probePreviewContextual(")
+            .nth(1)
+            .and_then(|tail| tail.split("end probePreviewContextual").next())
+            .expect("contextual preview");
+        assert!(preview.contains("findContextualNoteContext"));
+        assert!(preview.contains("set noteProperties to properties of noteRef"));
+        assert!(preview.contains("previewFoundationPayload"));
+    }
+
+    #[test]
+    fn contextual_404_response_maps_to_context_mismatch() {
+        let error = map_error(
+            "preview-contextual",
+            Some(WireError {
+                source: "AppleScript".into(),
+                code: "404".into(),
+                message: "context mismatch: note not found in supplied account/folder".into(),
+            }),
+        );
+        assert!(matches!(error, NotesError::ContextMismatch { .. }));
+    }
+
+    #[test]
+    fn unrelated_404_does_not_map_to_context_mismatch() {
+        let error = map_error(
+            "preview",
+            Some(WireError {
+                source: "AppleScript".into(),
+                code: "404".into(),
+                message: "note not found: opaque".into(),
+            }),
+        );
+        assert!(matches!(error, NotesError::NotFound { .. }));
+    }
+
+    #[test]
+    fn properties_snapshot_shape_is_privacy_safe() {
+        let handler = CANONICAL_SCRIPT
+            .split("on probePropertiesShape(noteId)")
+            .nth(1)
+            .and_then(|tail| tail.split("end probePropertiesShape").next())
+            .expect("shape handler");
+        assert!(handler.contains("set noteProperties to properties of noteRef"));
+        assert!(handler.contains("classification"));
+        assert!(!handler.contains("my putString(resultItem, \"name\""));
+        assert!(!handler.contains("body of noteRef"));
+        assert!(!handler.contains("plaintext of noteRef"));
+    }
+
     #[test]
     fn apple_events_capabilities_match_phase_4_1_probes() {
         let capabilities = AppleScriptNotesBackend::new().capabilities();
@@ -937,12 +1274,24 @@ mod tests {
             serde_json::from_str::<WireNoteSummary>(include_str!("../fixtures/note-summary.json"))
                 .unwrap()
                 .into();
-        assert_eq!(note.attachment_count, 2);
+        assert_eq!(note.attachment_count, Some(2));
     }
     #[test]
     fn decodes_get_note() {
         let raw: WireNote = serde_json::from_str(include_str!("../fixtures/note.json")).unwrap();
         assert_eq!(raw.into_note(vec![]).body_html, "<div>Sample</div>");
+    }
+    #[test]
+    fn combined_preview_returns_note_and_attachment_metadata() {
+        let raw: WirePreview = serde_json::from_str(
+            r#"{"note":{"id":"note-1","name":"Sample","accountId":"account-1","folderId":"folder-1","bodyHtml":"<div>Body</div>","plaintext":"Body","creationDateText":"2024-01-01","modificationDateText":"2024-01-02","passwordProtected":false,"shared":false},"attachments":[{"id":"attachment-1","noteId":"note-1","name":"file.pdf","contentIdentifier":"cid","url":null,"creationDateText":"2024-01-01","modificationDateText":"2024-01-02","shared":false}]}"#,
+        )
+        .unwrap();
+        let note = raw.into_note(AttachmentCapabilities::notes_apple_events());
+        assert_eq!(note.summary.id, NoteId::from("note-1"));
+        assert_eq!(note.body_html, "<div>Body</div>");
+        assert_eq!(note.attachments.len(), 1);
+        assert_eq!(note.attachments[0].id, AttachmentId::from("attachment-1"));
     }
     #[test]
     fn delete_is_not_modelled_as_guaranteed_destruction() {

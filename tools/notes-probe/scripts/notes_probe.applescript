@@ -1,3 +1,6 @@
+use framework "Foundation"
+use scripting additions
+
 -- Phase 0 capability probe for Notes.app.
 -- Every operation goes through the public AppleScript dictionary exposed by Notes.
 -- Arguments are supplied by osascript argv; user values are never interpolated into
@@ -17,8 +20,47 @@ on run argv
 			set payload to my probeFolders(my argumentAt(argv, 2))
 		else if operationName is "notes" then
 			set payload to my probeNotes(my argumentAt(argv, 2), my argumentAt(argv, 3), my integerArgument(argv, 4))
+
 		else if operationName is "get-note" then
 			set payload to my probeGetNote(my argumentAt(argv, 2))
+		else if operationName is "preview" then
+			return my probePreview(my argumentAt(argv, 2))
+		else if operationName is "lookup" then
+			set payload to my probeDiagnostic(my argumentAt(argv, 2), "lookup")
+		else if operationName is "metadata" then
+			set payload to my probeDiagnostic(my argumentAt(argv, 2), "metadata")
+		else if operationName is "body" then
+			set payload to my probeDiagnostic(my argumentAt(argv, 2), "body")
+		else if operationName is "plaintext" then
+			set payload to my probeDiagnostic(my argumentAt(argv, 2), "plaintext")
+		else if operationName is "body-plaintext" then
+			set payload to my probeDiagnostic(my argumentAt(argv, 2), "body-plaintext")
+		else if operationName is "attachment-count" then
+			set payload to my probeDiagnostic(my argumentAt(argv, 2), "attachment-count")
+		else if operationName is "foundation-graph-only" then
+			set payload to my foundationGraphOnly()
+		else if operationName is "foundation-serialize-only" then
+			set payload to my foundationSerializeOnly()
+		else if operationName is "foundation-full-local" then
+			set payload to my foundationFullLocal()
+		else if operationName is "preview-meta-properties" then
+			set payload to my probeMetadataDiagnostic(my argumentAt(argv, 2), "properties")
+		else if operationName is "preview-meta-properties-shape" then
+			set payload to my probePropertiesShape(my argumentAt(argv, 2))
+		else if operationName is "preview-meta-properties-all" then
+			set payload to my probeMetadataPropertiesAll(my argumentAt(argv, 2))
+		else if operationName is "preview-properties-full" then
+			set payload to my probePropertiesFull(my argumentAt(argv, 2))
+		else if operationName is "lookup-contextual" then
+			set payload to my contextualLookupPayload(my argumentAt(argv, 2), my argumentAt(argv, 3), my argumentAt(argv, 4))
+		else if operationName is "preview-contextual" then
+			return my probePreviewContextual(my argumentAt(argv, 2), my argumentAt(argv, 3), my argumentAt(argv, 4))
+		else if operationName starts with "preview-meta-" then
+			set payload to my probeMetadataDiagnostic(my argumentAt(argv, 2), operationName)
+		else if operationName is "preview-stage-full" then
+			set payload to my probeSerializedStage(my argumentAt(argv, 2), operationName)
+		else if operationName starts with "preview-stage-" then
+			set payload to my probeSerializedStage(my argumentAt(argv, 2), operationName)
 		else if operationName is "create-note" then
 			set payload to my probeCreateNote(my argumentAt(argv, 2), my argumentAt(argv, 3), my argumentAt(argv, 4))
 		else if operationName is "create-folder" then
@@ -120,6 +162,7 @@ on walkFolders(folderRefs, accountId, parentKind, parentId)
 	return resultItems
 end walkFolders
 
+
 on probeNotes(accountFilter, folderFilter, limitCount)
 	set collectionState to {seenIds:{}, serializedItems:{}, uniqueNoteCount:0, matchedAccount:false, matchedFolder:false}
 	tell application "Notes" to set accountRefs to every account
@@ -166,7 +209,6 @@ on collectNotesFromFolders(folderRefs, currentAccountId, folderFilter, limitCoun
 					tell application "Notes"
 						set noteValues to get {id, name, creation date, modification date, password protected, shared} of every note of folderRef
 						set noteIds to item 1 of noteValues
-						set attachmentGroups to attachments of every note of folderRef
 					end tell
 				on error
 					set noteValues to missing value
@@ -195,7 +237,7 @@ on collectNotesFromFolders(folderRefs, currentAccountId, folderFilter, limitCoun
 								set seenIds of collectionState to (seenIds of collectionState) & {currentNoteId}
 								set uniqueNoteCount of collectionState to (uniqueNoteCount of collectionState) + 1
 								if limitCount is 0 or (count of serializedItems of collectionState) < limitCount then
-									set end of serializedItems of collectionState to my noteMetadataFromValues(noteIndex, noteValues, attachmentGroups, currentFolderId)
+									set end of serializedItems of collectionState to my noteMetadataFromValues(noteIndex, noteValues, currentFolderId)
 								end if
 							end if
 						end try
@@ -235,6 +277,463 @@ on probeGetNote(noteId)
 		"\"passwordProtected\":" & my jsonBoolean(isProtected) & "," & ¬
 		"\"shared\":" & my jsonBoolean(isShared) & "}"
 end probeGetNote
+
+on probePreview(noteId)
+	set noteContext to my findNoteContext(noteId)
+	set noteRef to noteReference of noteContext
+	set accountId to accountId of noteContext
+	set folderId to folderId of noteContext
+	tell application "Notes"
+		set noteProperties to properties of noteRef
+		set noteName to name of noteProperties
+		set noteBody to body of noteProperties
+		set notePlaintext to plaintext of noteProperties
+		set createdText to (creation date of noteProperties) as text
+		set modifiedText to (modification date of noteProperties) as text
+		set isProtected to password protected of noteProperties
+		set isShared to shared of noteProperties
+		set attachmentRefs to every attachment of noteRef
+	end tell
+	set attachmentItems to {}
+	repeat with attachmentRef in attachmentRefs
+		tell application "Notes"
+			set attachmentId to id of attachmentRef
+			set attachmentName to name of attachmentRef
+			set contentId to content identifier of attachmentRef
+			set attachmentCreatedText to (creation date of attachmentRef) as text
+			set attachmentModifiedText to (modification date of attachmentRef) as text
+			set attachmentShared to shared of attachmentRef
+			set attachmentUrl to missing value
+			try
+				set attachmentUrl to URL of attachmentRef
+			end try
+		end tell
+		set attachmentItem to current application's NSMutableDictionary's dictionary()
+		my putString(attachmentItem, "id", attachmentId)
+		my putString(attachmentItem, "noteId", noteId)
+		my putString(attachmentItem, "name", attachmentName)
+		my putOptionalString(attachmentItem, "contentIdentifier", contentId)
+		my putOptionalString(attachmentItem, "url", attachmentUrl)
+		my putString(attachmentItem, "creationDateText", attachmentCreatedText)
+		my putString(attachmentItem, "modificationDateText", attachmentModifiedText)
+		my putBoolean(attachmentItem, "shared", attachmentShared)
+		set end of attachmentItems to attachmentItem
+	end repeat
+	set noteItem to current application's NSMutableDictionary's dictionary()
+	my putString(noteItem, "id", noteId)
+	my putString(noteItem, "name", noteName)
+	my putString(noteItem, "accountId", accountId)
+	my putString(noteItem, "folderId", folderId)
+	my putString(noteItem, "bodyHtml", noteBody)
+	my putString(noteItem, "plaintext", notePlaintext)
+	my putString(noteItem, "creationDateText", createdText)
+	my putString(noteItem, "modificationDateText", modifiedText)
+	my putBoolean(noteItem, "passwordProtected", isProtected)
+	my putBoolean(noteItem, "shared", isShared)
+	set dataItem to current application's NSMutableDictionary's dictionary()
+	dataItem's setObject:noteItem forKey:"note"
+	set attachmentArray to current application's NSMutableArray's arrayWithArray:attachmentItems
+	dataItem's setObject:attachmentArray forKey:"attachments"
+	set rootItem to current application's NSMutableDictionary's dictionary()
+	my putString(rootItem, "schemaVersion", schemaVersion)
+	my putString(rootItem, "operation", "preview")
+	my putBoolean(rootItem, "ok", true)
+	rootItem's setObject:dataItem forKey:"data"
+	return my foundationJson(rootItem)
+end probePreview
+
+on probePreviewContextual(noteId, suppliedAccountId, suppliedFolderId)
+	set noteContext to my findContextualNoteContext(noteId, suppliedAccountId, suppliedFolderId)
+	set noteRef to noteReference of noteContext
+	set accountId to accountId of noteContext
+	set folderId to folderId of noteContext
+	tell application "Notes"
+		set noteProperties to properties of noteRef
+		set noteName to name of noteProperties
+		set noteBody to body of noteProperties
+		set notePlaintext to plaintext of noteProperties
+		set createdText to (creation date of noteProperties) as text
+		set modifiedText to (modification date of noteProperties) as text
+		set isProtected to password protected of noteProperties
+		set isShared to shared of noteProperties
+		set attachmentRefs to every attachment of noteRef
+	end tell
+	return my previewFoundationPayload(noteId, accountId, folderId, noteName, noteBody, notePlaintext, createdText, modifiedText, isProtected, isShared, attachmentRefs)
+end probePreviewContextual
+
+on previewFoundationPayload(noteId, accountId, folderId, noteName, noteBody, notePlaintext, createdText, modifiedText, isProtected, isShared, attachmentRefs)
+	set attachmentItems to {}
+	repeat with attachmentRef in attachmentRefs
+		tell application "Notes"
+			set attachmentId to id of attachmentRef
+			set attachmentName to name of attachmentRef
+			set contentId to content identifier of attachmentRef
+			set attachmentCreatedText to (creation date of attachmentRef) as text
+			set attachmentModifiedText to (modification date of attachmentRef) as text
+			set attachmentShared to shared of attachmentRef
+			set attachmentUrl to missing value
+			try
+				set attachmentUrl to URL of attachmentRef
+			end try
+		end tell
+		set attachmentItem to current application's NSMutableDictionary's dictionary()
+		my putString(attachmentItem, "id", attachmentId)
+		my putString(attachmentItem, "noteId", noteId)
+		my putString(attachmentItem, "name", attachmentName)
+		my putOptionalString(attachmentItem, "contentIdentifier", contentId)
+		my putOptionalString(attachmentItem, "url", attachmentUrl)
+		my putString(attachmentItem, "creationDateText", attachmentCreatedText)
+		my putString(attachmentItem, "modificationDateText", attachmentModifiedText)
+		my putBoolean(attachmentItem, "shared", attachmentShared)
+		set end of attachmentItems to attachmentItem
+	end repeat
+	set noteItem to current application's NSMutableDictionary's dictionary()
+	my putString(noteItem, "id", noteId)
+	my putString(noteItem, "name", noteName)
+	my putString(noteItem, "accountId", accountId)
+	my putString(noteItem, "folderId", folderId)
+	my putString(noteItem, "bodyHtml", noteBody)
+	my putString(noteItem, "plaintext", notePlaintext)
+	my putString(noteItem, "creationDateText", createdText)
+	my putString(noteItem, "modificationDateText", modifiedText)
+	my putBoolean(noteItem, "passwordProtected", isProtected)
+	my putBoolean(noteItem, "shared", isShared)
+	set dataItem to current application's NSMutableDictionary's dictionary()
+	dataItem's setObject:noteItem forKey:"note"
+	dataItem's setObject:(current application's NSMutableArray's arrayWithArray:attachmentItems) forKey:"attachments"
+	set rootItem to current application's NSMutableDictionary's dictionary()
+	my putString(rootItem, "schemaVersion", schemaVersion)
+	my putString(rootItem, "operation", "preview")
+	my putBoolean(rootItem, "ok", true)
+	rootItem's setObject:dataItem forKey:"data"
+	return my foundationJson(rootItem)
+end previewFoundationPayload
+
+on contextualLookupPayload(noteId, suppliedAccountId, suppliedFolderId)
+	set context to my findContextualNoteContext(noteId, suppliedAccountId, suppliedFolderId)
+	set resultItem to current application's NSMutableDictionary's dictionary()
+	my putString(resultItem, "noteId", noteId)
+	my putString(resultItem, "accountId", accountId of context)
+	my putString(resultItem, "folderId", folderId of context)
+	return my foundationJson(resultItem)
+end contextualLookupPayload
+
+on putString(target, keyName, value)
+	target's setObject:(current application's NSString's stringWithString:(value as text)) forKey:keyName
+end putString
+
+on putOptionalString(target, keyName, value)
+	if value is missing value then
+		target's setObject:(current application's NSNull's null()) forKey:keyName
+	else
+		my putString(target, keyName, value)
+	end if
+end putOptionalString
+
+on putBoolean(target, keyName, value)
+	target's setObject:(current application's NSNumber's numberWithBool:value) forKey:keyName
+end putBoolean
+
+on foundationJson(rootItem)
+	set resultWithError to current application's NSJSONSerialization's dataWithJSONObject:rootItem options:0 |error|:(reference)
+	set jsonData to item 1 of resultWithError
+	if jsonData is missing value then error "JSON serialization failed" number 500
+	set jsonText to current application's NSString's alloc()'s initWithData:jsonData encoding:(current application's NSUTF8StringEncoding)
+	if jsonText is missing value then error "JSON UTF-8 conversion failed" number 500
+	return jsonText as text
+end foundationJson
+
+on probeDiagnostic(noteId, modeName)
+	set noteContext to my findNoteContext(noteId)
+	if modeName is "lookup" then return "{\"id\":" & my jsonString(noteId) & "}"
+	set noteRef to noteReference of noteContext
+	tell application "Notes"
+		if modeName is "metadata" then
+			set ignoredName to name of noteRef
+			set ignoredCreated to creation date of noteRef
+			set ignoredModified to modification date of noteRef
+			set ignoredProtected to password protected of noteRef
+			set ignoredShared to shared of noteRef
+		else if modeName is "body" then
+			set ignoredBody to body of noteRef
+		else if modeName is "plaintext" then
+			set ignoredPlaintext to plaintext of noteRef
+		else if modeName is "body-plaintext" then
+			set ignoredBody to body of noteRef
+			set ignoredPlaintext to plaintext of noteRef
+		else if modeName is "attachment-count" then
+			set ignoredCount to count of attachments of noteRef
+		else if modeName is "attachments" then
+			set ignoredAttachments to every attachment of noteRef
+		end if
+	end tell
+	if modeName is "attachment-count" then return "{\"id\":" & my jsonString(noteId) & ",\"count\":" & ignoredCount & "}"
+	return "{\"id\":" & my jsonString(noteId) & ",\"ok\":true}"
+end probeDiagnostic
+
+on probeMetadataDiagnostic(noteId, modeName)
+	set noteContext to my findNoteContext(noteId)
+	set noteRef to noteReference of noteContext
+	set accountId to accountId of noteContext
+	set folderId to folderId of noteContext
+	set resultItem to current application's NSMutableDictionary's dictionary()
+	my putString(resultItem, "id", noteId)
+	my putString(resultItem, "accountId", accountId)
+	my putString(resultItem, "folderId", folderId)
+	tell application "Notes"
+		if modeName is "preview-meta-name" or modeName is "preview-meta-all" then set noteName to name of noteRef
+		if modeName is "preview-meta-created" or modeName is "preview-meta-all" then set createdText to (creation date of noteRef) as text
+		if modeName is "preview-meta-modified" or modeName is "preview-meta-all" then set modifiedText to (modification date of noteRef) as text
+		if modeName is "preview-meta-protection" or modeName is "preview-meta-all" then set isProtected to password protected of noteRef
+		if modeName is "preview-meta-shared" or modeName is "preview-meta-all" then set isShared to shared of noteRef
+		if modeName is "preview-meta-properties" then
+			set noteProperties to properties of noteRef
+			set noteName to name of noteProperties
+			set createdText to (creation date of noteProperties) as text
+			set modifiedText to (modification date of noteProperties) as text
+			set isProtected to password protected of noteProperties
+			set isShared to shared of noteProperties
+		end if
+	end tell
+	if modeName is "preview-meta-name" or modeName is "preview-meta-all" or modeName is "preview-meta-properties" then my putString(resultItem, "name", noteName)
+	if modeName is "preview-meta-created" or modeName is "preview-meta-all" or modeName is "preview-meta-properties" then my putString(resultItem, "creationDateText", createdText)
+	if modeName is "preview-meta-modified" or modeName is "preview-meta-all" or modeName is "preview-meta-properties" then my putString(resultItem, "modificationDateText", modifiedText)
+	if modeName is "preview-meta-protection" or modeName is "preview-meta-all" or modeName is "preview-meta-properties" then my putBoolean(resultItem, "passwordProtected", isProtected)
+	if modeName is "preview-meta-shared" or modeName is "preview-meta-all" or modeName is "preview-meta-properties" then my putBoolean(resultItem, "shared", isShared)
+	return my foundationJson(resultItem)
+end probeMetadataDiagnostic
+
+on probeMetadataPropertiesAll(noteId)
+	set noteContext to my findNoteContext(noteId)
+	set noteRef to noteReference of noteContext
+	set accountId to accountId of noteContext
+	set folderId to folderId of noteContext
+	tell application "Notes"
+		set noteProperties to properties of noteRef
+		set localName to name of noteProperties
+		set localCreated to (creation date of noteProperties) as text
+		set localModified to (modification date of noteProperties) as text
+		set localProtected to password protected of noteProperties
+		set localShared to shared of noteProperties
+	end tell
+	set resultItem to current application's NSMutableDictionary's dictionary()
+	my putString(resultItem, "id", noteId)
+	my putString(resultItem, "accountId", accountId)
+	my putString(resultItem, "folderId", folderId)
+	my putString(resultItem, "name", localName)
+	my putString(resultItem, "creationDateText", localCreated)
+	my putString(resultItem, "modificationDateText", localModified)
+	my putBoolean(resultItem, "passwordProtected", localProtected)
+	my putBoolean(resultItem, "shared", localShared)
+	return my foundationJson(resultItem)
+end probeMetadataPropertiesAll
+
+on probePropertiesShape(noteId)
+	set noteContext to my findNoteContext(noteId)
+	set noteRef to noteReference of noteContext
+	tell application "Notes"
+		set noteProperties to properties of noteRef
+	end tell
+	set resultItem to current application's NSMutableDictionary's dictionary()
+	my putShape(resultItem, "id", noteProperties, "id")
+	my putShape(resultItem, "name", noteProperties, "name")
+	my putShape(resultItem, "creationDate", noteProperties, "creation date")
+	my putShape(resultItem, "modificationDate", noteProperties, "modification date")
+	my putShape(resultItem, "passwordProtected", noteProperties, "password protected")
+	my putShape(resultItem, "shared", noteProperties, "shared")
+	my putShape(resultItem, "body", noteProperties, "body")
+	my putShape(resultItem, "plaintext", noteProperties, "plaintext")
+	set attachmentsShape to current application's NSMutableDictionary's dictionary()
+	my putBoolean(attachmentsShape, "present", false)
+	my putString(attachmentsShape, "classification", "element-collection")
+	resultItem's setObject:attachmentsShape forKey:"attachments"
+	return my foundationJson(resultItem)
+end probePropertiesShape
+
+on putShape(target, keyName, recordValue, fieldName)
+	set shape to current application's NSMutableDictionary's dictionary()
+	try
+		using terms from application "Notes"
+			if fieldName is "id" then set fieldValue to id of recordValue
+			if fieldName is "name" then set fieldValue to name of recordValue
+			if fieldName is "creation date" then set fieldValue to creation date of recordValue
+			if fieldName is "modification date" then set fieldValue to modification date of recordValue
+			if fieldName is "password protected" then set fieldValue to password protected of recordValue
+			if fieldName is "shared" then set fieldValue to shared of recordValue
+			if fieldName is "body" then set fieldValue to body of recordValue
+			if fieldName is "plaintext" then set fieldValue to plaintext of recordValue
+		end using terms from
+		my putBoolean(shape, "present", true)
+		my putString(shape, "type", my foundationTypeOf(fieldValue))
+	on error
+		my putBoolean(shape, "present", false)
+	end try
+	target's setObject:shape forKey:keyName
+end putShape
+
+on foundationTypeOf(value)
+	set valueClass to class of value
+	if valueClass is boolean then return "boolean"
+	if valueClass is date then return "date"
+	if valueClass is integer or valueClass is real then return "number"
+	return "text"
+end foundationTypeOf
+
+on probePropertiesFull(noteId)
+	set noteContext to my findNoteContext(noteId)
+	set noteRef to noteReference of noteContext
+	set accountId to accountId of noteContext
+	set folderId to folderId of noteContext
+	tell application "Notes"
+		set noteProperties to properties of noteRef
+		set attachmentRefs to every attachment of noteRef
+		set localName to name of noteProperties
+		set localBody to body of noteProperties
+		set localPlaintext to plaintext of noteProperties
+		set localCreated to (creation date of noteProperties) as text
+		set localModified to (modification date of noteProperties) as text
+		set localProtected to password protected of noteProperties
+		set localShared to shared of noteProperties
+	end tell
+	set noteItem to current application's NSMutableDictionary's dictionary()
+	my putString(noteItem, "id", noteId)
+	my putString(noteItem, "name", localName)
+	my putString(noteItem, "accountId", accountId)
+	my putString(noteItem, "folderId", folderId)
+	my putString(noteItem, "bodyHtml", localBody)
+	my putString(noteItem, "plaintext", localPlaintext)
+	my putString(noteItem, "creationDateText", localCreated)
+	my putString(noteItem, "modificationDateText", localModified)
+	my putBoolean(noteItem, "passwordProtected", localProtected)
+	my putBoolean(noteItem, "shared", localShared)
+	set dataItem to current application's NSMutableDictionary's dictionary()
+	dataItem's setObject:noteItem forKey:"note"
+	dataItem's setObject:(current application's NSMutableArray's array()) forKey:"attachments"
+	set rootItem to current application's NSMutableDictionary's dictionary()
+	my putString(rootItem, "schemaVersion", schemaVersion)
+	my putString(rootItem, "operation", "preview")
+	my putBoolean(rootItem, "ok", true)
+	rootItem's setObject:dataItem forKey:"data"
+	return my foundationJson(rootItem)
+end probePropertiesFull
+
+on probeSerializedStage(noteId, stageName)
+	set noteContext to my findNoteContext(noteId)
+	set noteRef to noteReference of noteContext
+	set accountId to accountId of noteContext
+	set folderId to folderId of noteContext
+	tell application "Notes"
+		set noteName to name of noteRef
+		set createdText to (creation date of noteRef) as text
+		set modifiedText to (modification date of noteRef) as text
+		set isProtected to password protected of noteRef
+		set isShared to shared of noteRef
+		if stageName is "preview-stage-body" or stageName is "preview-stage-body-plaintext" or stageName is "preview-stage-note-serialized" or stageName is "preview-stage-full" then set noteBody to body of noteRef
+		if stageName is "preview-stage-plaintext" or stageName is "preview-stage-body-plaintext" or stageName is "preview-stage-note-serialized" or stageName is "preview-stage-full" then set notePlaintext to plaintext of noteRef
+		if stageName is "preview-stage-attachments" or stageName is "preview-stage-full" then set attachmentRefs to every attachment of noteRef
+	end tell
+	set noteItem to current application's NSMutableDictionary's dictionary()
+	my putString(noteItem, "id", noteId)
+	my putString(noteItem, "name", noteName)
+	my putString(noteItem, "accountId", accountId)
+	my putString(noteItem, "folderId", folderId)
+	if stageName is "preview-stage-body" or stageName is "preview-stage-body-plaintext" or stageName is "preview-stage-note-serialized" then my putString(noteItem, "bodyHtml", noteBody)
+	if stageName is "preview-stage-plaintext" or stageName is "preview-stage-body-plaintext" or stageName is "preview-stage-note-serialized" then my putString(noteItem, "plaintext", notePlaintext)
+	my putString(noteItem, "creationDateText", createdText)
+	my putString(noteItem, "modificationDateText", modifiedText)
+	my putBoolean(noteItem, "passwordProtected", isProtected)
+	my putBoolean(noteItem, "shared", isShared)
+	set payloadItem to noteItem
+	if stageName is "preview-stage-note-serialized" then
+		set wrapper to current application's NSMutableDictionary's dictionary()
+		wrapper's setObject:noteItem forKey:"note"
+		set payloadItem to wrapper
+	else if stageName is "preview-stage-attachments" then
+		set payloadItem to my foundationAttachmentPayload(noteId, attachmentRefs)
+	end if
+	return my foundationJson(payloadItem)
+	error "unknown preview diagnostic stage" number 64
+end probeSerializedStage
+
+on foundationAttachmentPayload(noteId, attachmentRefs)
+	set attachmentItems to {}
+	repeat with attachmentRef in attachmentRefs
+		tell application "Notes"
+			set attachmentId to id of attachmentRef
+			set attachmentName to name of attachmentRef
+			set contentId to content identifier of attachmentRef
+			set createdText to (creation date of attachmentRef) as text
+			set modifiedText to (modification date of attachmentRef) as text
+			set isShared to shared of attachmentRef
+		end tell
+		set itemDict to current application's NSMutableDictionary's dictionary()
+		my putString(itemDict, "id", attachmentId)
+		my putString(itemDict, "noteId", noteId)
+		my putString(itemDict, "name", attachmentName)
+		my putOptionalString(itemDict, "contentIdentifier", contentId)
+		my putString(itemDict, "creationDateText", createdText)
+		my putString(itemDict, "modificationDateText", modifiedText)
+		my putBoolean(itemDict, "shared", isShared)
+		set end of attachmentItems to itemDict
+	end repeat
+	set resultDict to current application's NSMutableDictionary's dictionary()
+	resultDict's setObject:(current application's NSMutableArray's arrayWithArray:attachmentItems) forKey:"attachments"
+	return resultDict
+end foundationAttachmentPayload
+
+on fixedFoundationGraph()
+	set noteItem to current application's NSMutableDictionary's dictionary()
+	my putString(noteItem, "id", "local-note-1")
+	my putString(noteItem, "name", "Foundation benchmark")
+	my putString(noteItem, "accountId", "local-account-1")
+	my putString(noteItem, "folderId", "local-folder-1")
+	my putString(noteItem, "bodyHtml", "<div>fixed benchmark body</div>")
+	my putString(noteItem, "plaintext", "fixed benchmark body")
+	my putString(noteItem, "creationDateText", "2026-01-01 00:00:00")
+	my putString(noteItem, "modificationDateText", "2026-01-01 00:00:00")
+	my putBoolean(noteItem, "passwordProtected", false)
+	my putBoolean(noteItem, "shared", false)
+	set dataItem to current application's NSMutableDictionary's dictionary()
+	dataItem's setObject:noteItem forKey:"note"
+	dataItem's setObject:(current application's NSMutableArray's array()) forKey:"attachments"
+	set rootItem to current application's NSMutableDictionary's dictionary()
+	my putString(rootItem, "schemaVersion", schemaVersion)
+	my putString(rootItem, "operation", "preview")
+	my putBoolean(rootItem, "ok", true)
+	rootItem's setObject:dataItem forKey:"data"
+	return rootItem
+end fixedFoundationGraph
+
+on foundationGraphOnly()
+	set ignoredGraph to my fixedFoundationGraph()
+	return "{\"graphBuilt\":true,\"attachments\":0}"
+end foundationGraphOnly
+
+on foundationSerializeOnly()
+	set graphItem to my fixedFoundationGraph()
+	return my foundationJson(graphItem)
+end foundationSerializeOnly
+
+on foundationFullLocal()
+	set graphItem to my fixedFoundationGraph()
+	return my foundationJson(graphItem)
+end foundationFullLocal
+
+on serializedAttachmentStage(noteId, attachmentRefs)
+	set resultItems to {}
+	repeat with attachmentRef in attachmentRefs
+		tell application "Notes"
+			set attachmentId to id of attachmentRef
+			set attachmentName to name of attachmentRef
+			set contentId to content identifier of attachmentRef
+			set createdText to (creation date of attachmentRef) as text
+			set modifiedText to (modification date of attachmentRef) as text
+			set isShared to shared of attachmentRef
+		end tell
+		set end of resultItems to "{\"id\":" & my jsonString(attachmentId) & ",\"noteId\":" & my jsonString(noteId) & ",\"name\":" & my jsonString(attachmentName) & ",\"contentIdentifier\":" & my jsonMaybeText(contentId) & ",\"creationDateText\":" & my jsonString(createdText) & ",\"modificationDateText\":" & my jsonString(modifiedText) & ",\"shared\":" & my jsonBoolean(isShared) & "}"
+	end repeat
+	return "{\"attachments\":[" & my joinText(resultItems, ",") & "]}"
+end serializedAttachmentStage
 
 on probeCreateNote(folderId, noteName, bodyHtml)
 	set folderRef to my findFolder(folderId)
@@ -496,11 +995,10 @@ on collectSnapshotFolders(folderRefs, currentAccountId, parentKind, parentId, li
 
 			set noteValues to missing value
 			try
-				tell application "Notes"
+					tell application "Notes"
 					set noteValues to get {id, name, creation date, modification date, password protected, shared} of every note of folderRef
-					set noteIds to item 1 of noteValues
-					set attachmentGroups to attachments of every note of folderRef
-				end tell
+						set noteIds to item 1 of noteValues
+					end tell
 			on error
 				set noteValues to missing value
 			end try
@@ -528,7 +1026,7 @@ on collectSnapshotFolders(folderRefs, currentAccountId, parentKind, parentId, li
 							set seenIds of snapshotState to (seenIds of snapshotState) & {currentNoteId}
 							set uniqueNoteCount of snapshotState to (uniqueNoteCount of snapshotState) + 1
 							if limitCount is 0 or (count of noteItems of snapshotState) < limitCount then
-								set end of noteItems of snapshotState to my noteMetadataFromValues(noteIndex, noteValues, attachmentGroups, currentFolderId)
+								set end of noteItems of snapshotState to my noteMetadataFromValues(noteIndex, noteValues, currentFolderId)
 							end if
 						end if
 					end try
@@ -540,6 +1038,7 @@ on collectSnapshotFolders(folderRefs, currentAccountId, parentKind, parentId, li
 	end repeat
 	return snapshotState
 end collectSnapshotFolders
+
 
 on noteMetadata(noteRef)
 	tell application "Notes" to set noteId to id of noteRef
@@ -569,20 +1068,16 @@ on noteMetadataFromContext(noteContext)
 		"\"modificationDateText\":" & my jsonString(modifiedText) & "," & ¬
 		"\"passwordProtected\":" & my jsonBoolean(isProtected) & "," & ¬
 		"\"shared\":" & my jsonBoolean(isShared) & "," & ¬
-		"\"attachmentCount\":" & my jsonMaybeInteger(attachmentCount) & "}"
+		"\"attachmentCount\":" & my jsonInteger(attachmentCount) & "}"
 end noteMetadataFromContext
 
-on noteMetadataFromValues(noteIndex, noteValues, attachmentGroups, currentFolderId)
+on noteMetadataFromValues(noteIndex, noteValues, currentFolderId)
 	set noteId to item noteIndex of item 1 of noteValues
 	set noteName to item noteIndex of item 2 of noteValues
 	set createdText to (item noteIndex of item 3 of noteValues) as text
 	set modifiedText to (item noteIndex of item 4 of noteValues) as text
 	set isProtected to item noteIndex of item 5 of noteValues
 	set isShared to item noteIndex of item 6 of noteValues
-	set attachmentCount to missing value
-	try
-		set attachmentCount to count of item noteIndex of attachmentGroups
-	end try
 	return "{" & ¬
 		"\"id\":" & my jsonString(noteId) & "," & ¬
 		"\"name\":" & my jsonString(noteName) & "," & ¬
@@ -590,8 +1085,7 @@ on noteMetadataFromValues(noteIndex, noteValues, attachmentGroups, currentFolder
 		"\"creationDateText\":" & my jsonString(createdText) & "," & ¬
 		"\"modificationDateText\":" & my jsonString(modifiedText) & "," & ¬
 		"\"passwordProtected\":" & my jsonBoolean(isProtected) & "," & ¬
-		"\"shared\":" & my jsonBoolean(isShared) & "," & ¬
-		"\"attachmentCount\":" & my jsonMaybeInteger(attachmentCount) & "}"
+		"\"shared\":" & my jsonBoolean(isShared) & "}"
 end noteMetadataFromValues
 
 on noteMetadataForIdIndividually(noteId, currentFolderId)
@@ -602,10 +1096,6 @@ on noteMetadataForIdIndividually(noteId, currentFolderId)
 		set modifiedText to (modification date of currentNote) as text
 		set isProtected to password protected of currentNote
 		set isShared to shared of currentNote
-		set attachmentCount to missing value
-		try
-			set attachmentCount to count of every attachment of currentNote
-		end try
 	end tell
 	return "{" & ¬
 		"\"id\":" & my jsonString(noteId) & "," & ¬
@@ -614,8 +1104,7 @@ on noteMetadataForIdIndividually(noteId, currentFolderId)
 		"\"creationDateText\":" & my jsonString(createdText) & "," & ¬
 		"\"modificationDateText\":" & my jsonString(modifiedText) & "," & ¬
 		"\"passwordProtected\":" & my jsonBoolean(isProtected) & "," & ¬
-		"\"shared\":" & my jsonBoolean(isShared) & "," & ¬
-		"\"attachmentCount\":" & my jsonMaybeInteger(attachmentCount) & "}"
+		"\"shared\":" & my jsonBoolean(isShared) & "}"
 end noteMetadataForIdIndividually
 
 on findAccount(accountId)
@@ -702,6 +1191,46 @@ on findNoteContext(targetNoteId)
 	error "note not found: " & targetNoteId number 404
 end findNoteContext
 
+on findContextualNoteContext(targetNoteId, targetAccountId, targetFolderId)
+	tell application "Notes" to set accountRefs to every account
+	repeat with accountRef in accountRefs
+		try
+			tell application "Notes" to set currentAccountId to id of accountRef
+			if currentAccountId is targetAccountId then
+				tell application "Notes" to set folderRefs to every folder of accountRef
+				set folderRef to my findFolderById(folderRefs, targetFolderId)
+				if folderRef is not missing value then
+					tell application "Notes"
+						set noteRefs to every note of folderRef
+						set noteIds to id of every note of folderRef
+					end tell
+					repeat with noteIndex from 1 to count of noteIds
+						if item noteIndex of noteIds is targetNoteId then
+							return {noteReference:(item noteIndex of noteRefs), noteId:targetNoteId, accountId:targetAccountId, folderId:targetFolderId}
+						end if
+					end repeat
+				end if
+			end if
+		end try
+	end repeat
+	error "context mismatch: note not found in supplied account/folder" number 404
+end findContextualNoteContext
+
+on findFolderById(folderRefs, targetFolderId)
+	repeat with folderRef in folderRefs
+		try
+			tell application "Notes"
+			set currentFolderId to id of folderRef
+			set childFolders to every folder of folderRef
+		end tell
+			if currentFolderId is targetFolderId then return folderRef
+			set nestedMatch to my findFolderById(childFolders, targetFolderId)
+			if nestedMatch is not missing value then return nestedMatch
+		end try
+	end repeat
+	return missing value
+end findFolderById
+
 on findNoteContextInFolders(folderRefs, currentAccountId, targetNoteId)
 	repeat with folderRef in folderRefs
 		try
@@ -778,21 +1307,25 @@ on jsonMaybeInteger(value)
 	return value as text
 end jsonMaybeInteger
 
+on jsonInteger(value)
+	try
+		set integerValue to value as integer
+		if integerValue < 0 then error "integer must be non-negative"
+		return integerValue as text
+	on error
+		error "attachment count is not a non-negative integer" number 500
+	end try
+end jsonInteger
+
 on jsonString(value)
-	set escapedText to value as text
-	set escapedText to my replaceText("\\", "\\\\", escapedText)
-	set escapedText to my replaceText("\"", "\\\"", escapedText)
-	set escapedText to my replaceText(character id 8, "\\b", escapedText)
-	set escapedText to my replaceText(character id 12, "\\f", escapedText)
-	set escapedText to my replaceText(linefeed, "\\n", escapedText)
-	set escapedText to my replaceText(return, "\\r", escapedText)
-	set escapedText to my replaceText(tab, "\\t", escapedText)
-	repeat with controlCode in {0, 1, 2, 3, 4, 5, 6, 7, 11, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31}
-		set numericCode to controlCode as integer
-		set unicodeEscape to "\\u00" & my hexDigit(numericCode div 16) & my hexDigit(numericCode mod 16)
-		set escapedText to my replaceText(character id numericCode, unicodeEscape, escapedText)
-	end repeat
-	return "\"" & escapedText & "\""
+	set nsValue to current application's NSString's stringWithString:(value as text)
+	set resultWithError to current application's NSJSONSerialization's dataWithJSONObject:nsValue options:(current application's NSJSONWritingFragmentsAllowed) |error|:(reference)
+	set jsonData to item 1 of resultWithError
+	set serializationError to item 2 of resultWithError
+	if jsonData is missing value then error "JSON serialization failed" number 500
+	set jsonText to current application's NSString's alloc()'s initWithData:jsonData encoding:(current application's NSUTF8StringEncoding)
+	if jsonText is missing value then error "JSON UTF-8 conversion failed" number 500
+	return jsonText as text
 end jsonString
 
 on hexDigit(value)

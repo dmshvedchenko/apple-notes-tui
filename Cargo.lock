@@ -321,7 +321,7 @@ dependencies = [
 
 [[package]]
 name = "notes-bridge"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "notes-core",
  "serde",
@@ -330,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "notes-cache"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "notes-core",
  "rusqlite",
@@ -341,7 +341,7 @@ dependencies = [
 
 [[package]]
 name = "notes-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -350,11 +350,11 @@ dependencies = [
 
 [[package]]
 name = "notes-probe"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "notes-tui"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "crossterm",
  "notes-bridge",

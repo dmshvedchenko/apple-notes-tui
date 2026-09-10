@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 const WRITE_ACK: &str = "I_UNDERSTAND_NOTES_WILL_CHANGE";
 const SCHEMA_VERSION: &str = "apple-notes-probe/v1";
 const OSASCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const CANONICAL_SCRIPT: &str = include_str!("../scripts/notes_probe.applescript");
 
 const USAGE: &str = r#"notes-probe — safe Apple Notes AppleScript capability probe
 
@@ -18,6 +20,37 @@ USAGE:
   notes-probe folders [--account-id ID]
   notes-probe notes [--account-id ID | --folder-id ID] [--limit N]
   notes-probe get-note --note-id ID
+  notes-probe preview --note-id ID
+  notes-probe lookup --note-id ID
+  notes-probe metadata --note-id ID
+  notes-probe body --note-id ID
+  notes-probe plaintext --note-id ID
+  notes-probe body-plaintext --note-id ID
+  notes-probe attachment-count --note-id ID
+  notes-probe preview-stage-metadata --note-id ID
+  notes-probe preview-stage-body --note-id ID
+  notes-probe preview-stage-plaintext --note-id ID
+  notes-probe preview-stage-body-plaintext --note-id ID
+  notes-probe preview-stage-note-serialized --note-id ID
+  notes-probe preview-stage-attachments --note-id ID
+  notes-probe preview-stage-full --note-id ID
+  notes-probe foundation-graph-only
+  notes-probe foundation-serialize-only
+  notes-probe foundation-full-local
+  notes-probe preview-meta-id --note-id ID
+  notes-probe preview-meta-name --note-id ID
+  notes-probe preview-meta-account-folder --note-id ID
+  notes-probe preview-meta-created --note-id ID
+  notes-probe preview-meta-modified --note-id ID
+  notes-probe preview-meta-protection --note-id ID
+  notes-probe preview-meta-shared --note-id ID
+  notes-probe preview-meta-all --note-id ID
+  notes-probe preview-meta-properties --note-id ID
+  notes-probe preview-meta-properties-shape --note-id ID
+  notes-probe preview-meta-properties-all --note-id ID
+  notes-probe preview-properties-full --note-id ID
+  notes-probe lookup-contextual --note-id ID --account-id ID --folder-id ID
+  notes-probe preview-contextual --note-id ID --account-id ID --folder-id ID
   notes-probe attachments --note-id ID
   notes-probe preview-attachment --note-id ID --attachment-id ID
   notes-probe snapshot [--limit N]
@@ -181,6 +214,67 @@ fn prepare(cli: &Cli) -> Result<Prepared, String> {
         "get-note" => {
             cli.reject_unknown(&["--note-id"], &[])?;
             Ok(invoke(vec!["get-note", cli.required("--note-id")?]))
+        }
+        "preview" => {
+            cli.reject_unknown(&["--note-id"], &[])?;
+            Ok(invoke(vec!["preview", cli.required("--note-id")?]))
+        }
+        "lookup" | "metadata" | "body" | "plaintext" | "body-plaintext" | "attachment-count" => {
+            cli.reject_unknown(&["--note-id"], &[])?;
+            Ok(invoke(vec![
+                cli.operation.as_str(),
+                cli.required("--note-id")?,
+            ]))
+        }
+        "foundation-graph-only" | "foundation-serialize-only" | "foundation-full-local" => {
+            cli.reject_unknown(&[], &[])?;
+            Ok(invoke(vec![cli.operation.as_str()]))
+        }
+        "preview-meta-id"
+        | "preview-meta-name"
+        | "preview-meta-account-folder"
+        | "preview-meta-created"
+        | "preview-meta-modified"
+        | "preview-meta-protection"
+        | "preview-meta-shared"
+        | "preview-meta-all"
+        | "preview-meta-properties" => {
+            cli.reject_unknown(&["--note-id"], &[])?;
+            Ok(invoke(vec![
+                cli.operation.as_str(),
+                cli.required("--note-id")?,
+            ]))
+        }
+        "preview-meta-properties-shape"
+        | "preview-meta-properties-all"
+        | "preview-properties-full" => {
+            cli.reject_unknown(&["--note-id"], &[])?;
+            Ok(invoke(vec![
+                cli.operation.as_str(),
+                cli.required("--note-id")?,
+            ]))
+        }
+        "lookup-contextual" | "preview-contextual" => {
+            cli.reject_unknown(&["--note-id", "--account-id", "--folder-id"], &[])?;
+            Ok(invoke(vec![
+                cli.operation.as_str(),
+                cli.required("--note-id")?,
+                cli.required("--account-id")?,
+                cli.required("--folder-id")?,
+            ]))
+        }
+        "preview-stage-metadata"
+        | "preview-stage-body"
+        | "preview-stage-plaintext"
+        | "preview-stage-body-plaintext"
+        | "preview-stage-note-serialized"
+        | "preview-stage-attachments"
+        | "preview-stage-full" => {
+            cli.reject_unknown(&["--note-id"], &[])?;
+            Ok(invoke(vec![
+                cli.operation.as_str(),
+                cli.required("--note-id")?,
+            ]))
         }
         "attachments" => {
             cli.reject_unknown(&["--note-id"], &[])?;
@@ -610,6 +704,85 @@ mod tests {
             ]
         );
         assert!(!is_mutation("preview-attachment"));
+    }
+
+    #[test]
+    fn diagnostic_cli_operations_have_canonical_applescript_dispatch() {
+        for operation in [
+            "lookup",
+            "metadata",
+            "body",
+            "plaintext",
+            "body-plaintext",
+            "attachment-count",
+            "preview-stage-metadata",
+            "preview-stage-body",
+            "preview-stage-plaintext",
+            "preview-stage-body-plaintext",
+            "preview-stage-note-serialized",
+            "preview-stage-attachments",
+            "preview-stage-full",
+            "foundation-graph-only",
+            "foundation-serialize-only",
+            "foundation-full-local",
+            "preview-meta-id",
+            "preview-meta-name",
+            "preview-meta-account-folder",
+            "preview-meta-created",
+            "preview-meta-modified",
+            "preview-meta-protection",
+            "preview-meta-shared",
+            "preview-meta-all",
+            "preview-meta-properties",
+            "preview-meta-properties-shape",
+            "preview-meta-properties-all",
+            "preview-properties-full",
+            "lookup-contextual",
+            "preview-contextual",
+        ] {
+            let prefix = if operation.starts_with("preview-stage-") {
+                "operationName starts with \"preview-stage-\""
+            } else {
+                "operationName starts with \"preview-meta-\""
+            };
+            assert!(
+                CANONICAL_SCRIPT.contains(&format!("operationName is \"{operation}\""))
+                    || (operation.starts_with("preview-stage-")
+                        || operation.starts_with("preview-meta-"))
+                        && CANONICAL_SCRIPT.contains(prefix),
+                "missing AppleScript dispatcher coverage for {operation}",
+            );
+        }
+    }
+
+    #[test]
+    fn build_script_provisions_canonical_runtime_sidecar() {
+        let build_script = include_str!("../build.rs");
+        assert!(build_script.contains("cargo:rerun-if-changed=scripts/notes_probe.applescript"));
+        assert!(build_script.contains("copy(&source, &destination)"));
+        assert!(build_script.contains("join(\"scripts\")"));
+    }
+
+    #[test]
+    fn foundation_local_diagnostics_use_native_object_graph_path() {
+        assert!(CANONICAL_SCRIPT.contains("on fixedFoundationGraph()"));
+        assert!(CANONICAL_SCRIPT.contains("on foundationGraphOnly()"));
+        assert!(CANONICAL_SCRIPT.contains("on foundationSerializeOnly()"));
+        assert!(CANONICAL_SCRIPT.contains("on foundationFullLocal()"));
+        assert!(CANONICAL_SCRIPT.contains("NSMutableArray's array()"));
+        assert!(CANONICAL_SCRIPT.contains("NSJSONSerialization's dataWithJSONObject"));
+    }
+
+    #[test]
+    fn production_preview_serializes_one_foundation_root() {
+        let preview = CANONICAL_SCRIPT
+            .split("on probePreview(noteId)")
+            .nth(1)
+            .and_then(|body| body.split("end probePreview").next())
+            .expect("preview handler");
+        assert!(preview.contains("return my foundationJson(rootItem)"));
+        assert_eq!(preview.matches("foundationJson(").count(), 1);
+        assert!(!preview.contains("jsonString(note"));
     }
 
     #[test]

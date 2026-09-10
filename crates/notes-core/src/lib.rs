@@ -152,7 +152,8 @@ pub struct NoteSummary {
     pub modification_date: NoteDate,
     pub password_protected: bool,
     pub shared: bool,
-    pub attachment_count: usize,
+    /// Exact only when a full preview has loaded the attachment collection.
+    pub attachment_count: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -403,7 +404,7 @@ pub enum Editability {
 
 pub fn classify_editability(note: &Note) -> Editability {
     let mut reasons = Vec::new();
-    if note.summary.attachment_count > 0 || !note.attachments.is_empty() {
+    if note.summary.attachment_count.unwrap_or(0) > 0 || !note.attachments.is_empty() {
         reasons.push("note contains attachments".into());
     }
     let lower = note.body_html.to_ascii_lowercase();
@@ -561,6 +562,8 @@ pub enum NotesError {
     Cancelled,
     #[error("Notes backend error: {0}")]
     Backend(String),
+    #[error("context mismatch for note {note_id}")]
+    ContextMismatch { note_id: NoteId },
 }
 
 fn display_features(features: &[RichFeature]) -> String {
@@ -604,6 +607,14 @@ pub trait NotesBackend: Send {
         &self,
         id: &NoteId,
         _cancel: Option<&AtomicBool>,
+    ) -> Result<Note, NotesError> {
+        self.get_note(id)
+    }
+    fn get_note_with_context(
+        &self,
+        id: &NoteId,
+        _account_id: &AccountId,
+        _folder_id: &FolderId,
     ) -> Result<Note, NotesError> {
         self.get_note(id)
     }
@@ -836,7 +847,7 @@ impl NotesBackend for MockNotesBackend {
                 modification_date: date,
                 password_protected: false,
                 shared: false,
-                attachment_count: 0,
+                attachment_count: Some(0),
             },
             account_id,
             body_html: request.body_html.clone(),
@@ -1150,7 +1161,7 @@ mod tests {
                 modification_date: NoteDate::new("date"),
                 password_protected: false,
                 shared: false,
-                attachment_count: 0,
+                attachment_count: Some(0),
             },
             account_id,
             body_html: "<div>Sample</div>".into(),
@@ -1459,7 +1470,7 @@ mod tests {
                 modification_date: NoteDate::new("date"),
                 password_protected: false,
                 shared: false,
-                attachment_count: 0,
+                attachment_count: Some(0),
             },
             account_id: account_a.id.clone(),
             body_html: String::new(),
@@ -1578,7 +1589,7 @@ mod tests {
                 modification_date: NoteDate::new("date"),
                 password_protected: false,
                 shared: false,
-                attachment_count: 0,
+                attachment_count: Some(0),
             },
             account_id: AccountId::from("account"),
             body_html: "<div>plain</div>".into(),
@@ -1594,7 +1605,7 @@ mod tests {
             Editability::ReadOnlyUnsupported { .. }
         ));
         note.body_html = "<div>plain</div>".into();
-        note.summary.attachment_count = 1;
+        note.summary.attachment_count = Some(1);
         assert!(matches!(
             classify_editability(&note),
             Editability::ReadOnlyUnsupported { .. }

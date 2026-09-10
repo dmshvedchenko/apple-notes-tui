@@ -354,7 +354,7 @@ mod tests {
                 modification_date: date,
                 password_protected: false,
                 shared: false,
-                attachment_count: 0,
+                attachment_count: Some(0),
             }],
             last_successful_refresh: Some("2026-08-28T12:00:00Z".into()),
         }
@@ -371,7 +371,7 @@ mod tests {
                 modification_date: date.clone(),
                 password_protected: false,
                 shared: false,
-                attachment_count: 1,
+                attachment_count: Some(1),
             },
             account_id: AccountId::from("account"),
             body_html: format!("<div>{body}</div>"),

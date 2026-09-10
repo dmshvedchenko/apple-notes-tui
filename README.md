@@ -255,6 +255,34 @@ Cached mode is read-only and attachment preview/export remains live-only.
 Successful live `get_note` is read-through cached; cache-write failures are
 warnings and never invalidate the live preview.
 
+Phase 17 A1i.1 adds privacy-safe, Notes-independent Foundation diagnostics:
+`foundation-graph-only`, `foundation-serialize-only`, and
+`foundation-full-local`. Preview stage diagnostics use the same native
+Foundation object graph and single `NSJSONSerialization` path as production;
+they do not access Notes.app or expose benchmark note data.
+
+Phase 17 A1j adds read-only incremental metadata diagnostics (`preview-meta-*`)
+and a `preview-meta-properties` experiment for comparing scalar reads with a
+Notes `properties` record. Production preview continues to preserve all
+metadata and stable NoteId semantics; no speculative bulk-read optimization is
+enabled without measured evidence.
+
+Phase 17 A1k adds a privacy-safe `preview-meta-properties-shape` probe and a
+diagnostic `preview-meta-properties-all` path. These validate the public Notes
+properties record before any production switch; normal preview remains on the
+scalar metadata path until field availability and interleaved timing are
+verified on a permitted fixture.
+
+Phase 17 A1m adds diagnostic-only contextual lookup commands accepting the
+known stable account and folder IDs. They constrain traversal to that account
+and folder and never fall back to global lookup; production preview remains
+unchanged.
+
+Phase 17 A1l promotes the measured public Notes `properties of noteRef`
+snapshot to the production `preview` path. Metadata, body, and plaintext are
+extracted from that one local snapshot; attachments remain a separate element
+collection. The wire schema and Foundation serialization are unchanged.
+
 `SqliteNotesCache::open` is strict; `open_or_recover` quarantines only corrupt
 SQLite or newer schemas, handling exactly the DB, `-wal`, and `-shm` paths as
 `.corrupt-<pid>-<counter>` before recreating v1. `--cache-info` reports local
@@ -477,6 +505,14 @@ requests are distinguished in opt-in performance tracing; startup establishes
 the next periodic deadline instead of triggering an immediate duplicate full
 refresh.
 
+The Notes list requests only summary fields plus attachment counts; attachment
+metadata is fetched only for a selected full-note preview or an explicit
+attachment action. This avoids loading every attachment object during folder
+list reads without changing the authoritative read or cache model. Optional
+diagnostics can be enabled with `APPLE_NOTES_TUI_PERF=1`; trace output is
+written to `/private/tmp/apple-notes-tui-perf.log` without note titles or
+bodies.
+
 CREATE and normal saves of existing notes use one short-lived worker: the editor is
 temporarily frozen while it reads for conflict detection and performs the
 ordinary update. The UI thread receives the result and calls `finish_saved`, so
@@ -597,6 +633,40 @@ summary rows are retained by stable `FolderId`, replaced only by an
 authoritative live folder result, and invalidated by note/folder mutations.
 Navigation workers apply only current-generation results, so stale folder or
 preview reads cannot overwrite newer runtime state. The current-context
-refresh sequence remains accounts -> folders -> notes -> selected preview ->
-attachments; cache writes remain on the UI thread. No global mirror,
+refresh sequence remains accounts -> folders -> notes -> one combined
+selected-preview read; cache writes remain on the UI thread. The read-only
+`preview` operation resolves one stable Note ID and returns the full note plus
+attachment metadata atomically. Attachment binaries remain on-demand through
+the existing explicit actions. No global mirror,
 NoteStore access, or transport/process optimization was added.
+
+Phase 17 A1n enables contextual preview hints for selected TUI notes when the
+summary's folder and loaded folder tree provide the account ID. Successful
+contextual reads use bounded lookup; an explicit context mismatch performs one
+global stable-ID fallback. Other backend, permission, parser, or protocol
+errors do not trigger fallback.
+
+Phase 17 A1n.3 removes attachment reads from the notes-list and snapshot hot path.
+`NoteSummary.attachment_count` is explicitly optional: `None` means the list did
+not load attachment metadata, while full preview derives the exact count from
+the returned attachment collection. No fake zero or nullable-deserialization
+fallback is used, and the targeted single-note attachment diagnostic remains
+available.
+
+Phase 17 A1n.4 makes production contextual preview use the same positional
+`osascript` contract as the working probe: `preview-contextual`, note ID,
+account ID, folder ID. Production resolves the release `scripts/notes_probe.applescript`
+sidecar when present, logs only final contextual argv identifiers under
+`APPLE_NOTES_TUI_PERF=1`, and classifies errors without logging note content.
+
+Phase 17 A1o measures the periodic refresh interval from successful live
+refresh reconciliation. Startup remains cache-first with a non-blocking live
+worker, but a successful startup result resets the 60-second periodic clock so
+no duplicate periodic refresh is launched immediately afterward. Failed live
+refreshes do not advance that success clock; explicit manual and mutation
+refreshes remain unaffected.
+
+Contextual preview diagnostics are classified narrowly: a structured
+`preview-contextual` context-mismatch response is decoded before transport
+status handling and triggers one global stable-ID fallback. Other AppleScript,
+permission, parser, protocol, and transport errors do not fall back.
